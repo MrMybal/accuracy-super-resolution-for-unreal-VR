@@ -48,7 +48,8 @@ inline void SetRCASParameters(
 	const FRDGTextureRef OutputTexture,
 	const float Sharpness,
 	const FIntRect& OutputRect,
-	FRDGBuilder& GraphBuilder)
+	FRDGBuilder& GraphBuilder,
+	const int32 OutputArraySlice = -1)  // Slice of OutputTexture to write when it is a multiview texture array
 {
 	FUintVector4 RcasConfig = { 0, 0, 0, 0 };
 	float SharpenessRemapped = (-2.0f * Sharpness) + 2.0f;
@@ -71,6 +72,5 @@ inline void SetRCASParameters(
 	RCASParameters->r_rcas_input = GraphBuilder.CreateSRV(RcasInputSRVDesc);
 
 	// RenderTarget
-	const FScreenPassRenderTarget UpscaledOutput(OutputTexture, OutputRect, ERenderTargetLoadAction::ENoAction);
-	RCASParameters->RenderTargets[0] = UpscaledOutput.GetRenderTargetBinding();
+	RCASParameters->RenderTargets[0] = FRenderTargetBinding(OutputTexture, ERenderTargetLoadAction::ENoAction, 0, OutputArraySlice);
 }

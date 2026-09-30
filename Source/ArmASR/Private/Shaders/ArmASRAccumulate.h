@@ -93,7 +93,8 @@ inline void SetAccumulateParameters(
 	const EShaderQualityPreset QualityPreset,
 	const FIntPoint& OutputExtents,
 	const FIntRect& OutputRect,
-	FRDGBuilder& GraphBuilder)
+	FRDGBuilder& GraphBuilder,
+	const int32 OutputArraySlice = -1)                  // Slice of OutputTexture to write when it is a multiview texture array
 {
 	// Sampler states
 	AccumulateParameters->s_LinearClamp = TStaticSamplerState<SF_Bilinear>::GetRHI();
@@ -183,7 +184,6 @@ inline void SetAccumulateParameters(
 	// Create RenderTargets and assign to parameters.
 	const FScreenPassRenderTarget InternalUpscaledColorRT(InternalUpscaledColorOutputTexture, OutputRect, ERenderTargetLoadAction::ENoAction);
 	const FScreenPassRenderTarget LockStatusRT(LockStatusOutputTexture, OutputRect, ERenderTargetLoadAction::ENoAction);
-	const FScreenPassRenderTarget UpscaledOutput(OutputTexture, OutputRect, ERenderTargetLoadAction::ENoAction);
 
 	AccumulateParameters->RenderTargets[0] = InternalUpscaledColorRT.GetRenderTargetBinding();
 	if (bIsUltraPerformance)
@@ -213,7 +213,7 @@ inline void SetAccumulateParameters(
 	if (!bUseRCAS)
 	{
 		const size_t index = bIsUltraPerformance ? 2 : 3;
-		AccumulateParameters->RenderTargets[index] = UpscaledOutput.GetRenderTargetBinding();
+		AccumulateParameters->RenderTargets[index] = FRenderTargetBinding(OutputTexture, ERenderTargetLoadAction::ENoAction, 0, OutputArraySlice);
 	}
 
 	// Assign common parameters to constant buffer.

@@ -40,21 +40,45 @@ float3 ComputeStaticVelocity(float2 ScreenPos, float DeviceZ)
 // SHADER RESOURCES
 //
 // =====================================================================================
+
+// When set, the pass also copies the input colour and depth of the current view into
+// textures whose origin is (0,0). Used for stereo side-by-side rendering, where the second
+// eye's view rect does not start at the texture origin.
+#ifndef ARMASR_COPY_INPUTS
+#define ARMASR_COPY_INPUTS 0
+#endif
+
 Texture2D InputDepth;
 Texture2D InputVelocity;
+#if ARMASR_COPY_INPUTS
+Texture2D InputColor;
+#endif
 
-float2 main(float4 SvPosition : SV_POSITION) : SV_Target0
+// Pixel offset of the view inside the input textures. Zero for mono and multiview
+// (each eye lives in its own array slice), ViewRect.Min for side-by-side stereo.
+int2 InputOffset;
+
+void main(
+    float4 SvPosition : SV_POSITION,
+    out float2 OutVelocity : SV_Target0
+#if ARMASR_COPY_INPUTS
+    , out float4 OutColor : SV_Target1
+    , out float OutDepth : SV_Target2
+#endif
+    )
 {
     uint2 Pos = uint2(SvPosition.xy);
+    int2 InputPos = int2(Pos) + InputOffset;
+    float Depth = InputDepth[InputPos].x;
+
     float2 Velocity = 0;
-    float4 EncodedVelocity = InputVelocity[Pos + View.ViewRectMin.xy];
+    float4 EncodedVelocity = InputVelocity[InputPos];
     if (EncodedVelocity.x > 0.0)
     {
         Velocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
     }
     else
     {
-        float Depth = InputDepth[Pos + View.ViewRectMin.xy].x;
         // This doesn't need the viewport origin as it is a UV, not a pixel coordinate (i.e. it is relative to the origin not (0,0))
         float2 ViewportUV = (Pos + 0.5) * View.ViewSizeAndInvSize.zw;
         float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
@@ -63,5 +87,10 @@ float2 main(float4 SvPosition : SV_POSITION) : SV_Target0
     }
 
     // FSR2 expects negative velocity from what UE4 produces.  FSR2 also wants the absolute result multiplied by (0.5, -0.5).  Combine these steps by multiplying by (-0.5, 0.5).
-    return Velocity * float2(-0.5, 0.5);
+    OutVelocity = Velocity * float2(-0.5, 0.5);
+
+#if ARMASR_COPY_INPUTS
+    OutColor = InputColor[InputPos];
+    OutDepth = Depth;
+#endif
 }

@@ -9,6 +9,7 @@
 #include "TemporalUpscaler.h"
 #include "ArmASRPassthroughDenoiser.h"
 #include "ArmASRSettings.h"
+#include "StereoRendering.h"
 
 #define ARM_ASR_ENABLE_VK 1
 
@@ -48,6 +49,14 @@ TAutoConsoleVariable<int32> CVarArmASRShaderQuality(
 	TEXT("r.ArmASR.ShaderQuality"),
 	1,
 	TEXT("Select shader quality preset. 1: Quality / 2: Balanced / 3: Performance / 4: Ultra Performance"),
+	ECVF_RenderThreadSafe);
+
+// Read by name by the optional Arm ASR engine patch (see EnginePatch/). The patched engine behaves like the original while this is 0.
+TAutoConsoleVariable<int32> CVarArmASRMobileUpscale(
+	TEXT("r.ArmASR.MobileUpscale"),
+	0,
+	TEXT("Mobile renderer only, requires the Arm ASR engine patch. Default is 0.\n")
+	TEXT("1: disable the tonemap subpass so the post-process chain runs the upscaler (Mobile HDR), and allow rendering at r.ScreenPercentage then upscaling with Arm ASR without post-processing (Mobile LDR)."),
 	ECVF_RenderThreadSafe);
 
 TAutoConsoleVariable<int32> CVarArmASRCreateReactiveMask(
@@ -160,47 +169,13 @@ IMPLEMENT_GLOBAL_SHADER(FArmASRRCASPS, "/Plugin/ArmASR/Private/RCASPass.usf", "m
 IMPLEMENT_GLOBAL_SHADER(FArmASRReconstructPrevDepthPS, "/Plugin/ArmASR/Private/ReconstructPrevDepthPass.usf", "main",
 						SF_Pixel);
 
-// History written by frame N and read by frame N + 1.
-class FArmASRTemporalAAHistory : public UE::Renderer::Private::ITemporalUpscaler::IHistory, public FRefCountBase
+// Multiview renders both eyes into a single 2-slice texture array, and only the primary view runs post-processing,
+// so a single AddPasses call may have to upscale up to two eyes.
+static constexpr int32 ArmASRMaxEyes = 2;
+
+// History resources of one eye.
+struct FArmASREyeHistory
 {
-public:
-	FArmASRTemporalAAHistory() :
-		UpscaledColour{ nullptr },
-		InternalReactive{ nullptr },
-		LumaHistory{ nullptr },
-		DilatedMotionVectors{ nullptr },
-		DilatedDepthMotionVectorsInputLuma{ nullptr },
-		LockStatus{ nullptr },
-		PreExposure { 0.0 }
-	{};
-
-	virtual ~FArmASRTemporalAAHistory() = default;
-
-	const TCHAR* GetDebugName() const override
-	{
-		return ArmASRUpscalerName;
-	}
-
-	uint64 GetGPUSizeBytes() const override
-	{
-	   return ComputeMemorySize();
-	}
-
-	uint32 AddRef() const final
-	{
-		return FRefCountBase::AddRef();
-	}
-
-	uint32 Release() const final
-	{
-		return FRefCountBase::Release();
-	}
-
-	uint32 GetRefCount() const final
-	{
-		return FRefCountBase::GetRefCount();
-	}
-
 	bool IsValid(const EShaderQualityPreset QualityPreset) const
 	{
 		bool AreRelevantMembersSet = true;
@@ -256,12 +231,18 @@ public:
 		{
 			Size += DilatedMotionVectors->ComputeMemorySize();
 		}
+		if (DilatedDepthMotionVectorsInputLuma)
+		{
+			Size += DilatedDepthMotionVectorsInputLuma->ComputeMemorySize();
+		}
 		if (LockStatus)
 		{
 			Size += LockStatus->ComputeMemorySize();
 		}
-
-		Size += sizeof(PreExposure);
+		if (NewLock)
+		{
+			Size += NewLock->ComputeMemorySize();
+		}
 
 		return Size;
 	}
@@ -273,112 +254,166 @@ public:
 	TRefCountPtr<IPooledRenderTarget> DilatedDepthMotionVectorsInputLuma;
 	TRefCountPtr<IPooledRenderTarget> LockStatus;
 	TRefCountPtr<IPooledRenderTarget> NewLock;
-	float PreExposure;
 };
 
-static int32_t FRAME_INDEX = 0;
-
-FArmASRTemporalUpscaler::FArmASRTemporalUpscaler(FArmASRInfo& ArmASRInfo, FArmASRPassthroughDenoiser& Denoiser)
-	: ArmASRInfo(ArmASRInfo), Denoiser(Denoiser)
+// History written by frame N and read by frame N + 1.
+class FArmASRTemporalAAHistory : public UE::Renderer::Private::ITemporalUpscaler::IHistory, public FRefCountBase
 {
-	GEngine->GetDynamicResolutionCurrentStateInfos(DynamicResolutionStateInfos);
-	FFXSystemInterface::RegisterCustomFXSystem(
-		ArmASRFXSystem::FXName,
-		// There is no guarantee that the FArmASRTemporalUpscaler is alive when this lambda is called.
-		// but the ArmASRInfo should be alive, so use that directly rather than passing the Upscaler.
-		FCreateCustomFXSystemDelegate::CreateLambda([&ArmASRInfo](ERHIFeatureLevel::Type InFeatureLevel, EShaderPlatform InShaderPlatform, FGPUSortManager* InGPUSortManager) -> FFXSystemInterface*
+public:
+	FArmASRTemporalAAHistory() = default;
+	virtual ~FArmASRTemporalAAHistory() = default;
+
+	const TCHAR* GetDebugName() const override
+	{
+		return ArmASRUpscalerName;
+	}
+
+	uint64 GetGPUSizeBytes() const override
+	{
+		return ComputeMemorySize();
+	}
+
+	uint32 AddRef() const final
+	{
+		return FRefCountBase::AddRef();
+	}
+
+	uint32 Release() const final
+	{
+		return FRefCountBase::Release();
+	}
+
+	uint32 GetRefCount() const final
+	{
+		return FRefCountBase::GetRefCount();
+	}
+
+	bool IsValid(const EShaderQualityPreset QualityPreset, const int32 InNumEyes, const FIntPoint& InOutputExtents) const
+	{
+		if (NumEyes != InNumEyes || OutputExtents != InOutputExtents)
+		{
+			return false;
+		}
+		for (int32 EyeIndex = 0; EyeIndex < NumEyes; ++EyeIndex)
+		{
+			if (!Eyes[EyeIndex].IsValid(QualityPreset))
 			{
-				return new ArmASRFXSystem(ArmASRInfo, InGPUSortManager);
-			}));
-}
+				return false;
+			}
+		}
+		return true;
+	}
 
-FArmASRTemporalUpscaler::~FArmASRTemporalUpscaler()
+	uint64 ComputeMemorySize() const
+	{
+		uint64 Size = sizeof(PreExposure);
+		for (int32 EyeIndex = 0; EyeIndex < NumEyes; ++EyeIndex)
+		{
+			Size += Eyes[EyeIndex].ComputeMemorySize();
+		}
+		return Size;
+	}
+
+	FArmASREyeHistory Eyes[ArmASRMaxEyes];
+	int32 NumEyes = 0;
+	FIntPoint OutputExtents = FIntPoint::ZeroValue;
+	int32 FrameIndex = 0;
+	float PreExposure = 0.0f;
+};
+
+// Settings shared by every eye of a frame.
+struct FArmASRFrameSettings
 {
-}
+	EShaderQualityPreset QualityPreset = EShaderQualityPreset::QUALITY;
+	bool bIsQuality = false;
+	bool bIsBalancedOrPerformance = false;
+	bool bIsPerformance = false;
+	bool bIsUltraPerformance = false;
+	bool bRequestedAutoExposure = false;
+	bool bAllowReactiveMask = false;
+	float Sharpness = 0.0f;
+	EPixelFormat MaskFormat = PF_R8;
+	int32 FrameIndex = 0;
+	float PrevPreExposure = 0.0f;
+	FIntPoint InputExtents = FIntPoint::ZeroValue;
+	FIntPoint OutputExtents = FIntPoint::ZeroValue;
+	FIntPoint InputExtentsQuantized = FIntPoint::ZeroValue;
+	FScreenPassTextureViewport InputViewport;
+	FScreenPassTextureViewport OutputViewport;
+	FRDGTextureRef EngineExposureTexture = nullptr; // Engine exposure, shared by both eyes. Null when auto exposure is used.
+};
 
-const TCHAR* FArmASRTemporalUpscaler::GetDebugName() const
+// Inputs and outputs of one eye.
+struct FArmASREyeContext
 {
-	return ArmASRUpscalerName;
+	// View whose matrices and uniform buffer describe this eye.
+	const FViewInfo* EyeView = nullptr;
+
+	// Scene textures (whole resource, possibly a multiview texture array).
+	FRDGTextureRef SceneColor = nullptr;
+	FRDGTextureRef SceneDepth = nullptr;
+	FRDGTextureRef SceneVelocity = nullptr;
+
+	// Array slice holding this eye, INDEX_NONE for plain 2D textures.
+	int32 ArraySlice = INDEX_NONE;
+
+	// Pixel position of this eye's view rect inside the scene textures (side-by-side stereo).
+	FIntPoint InputOffset = FIntPoint::ZeroValue;
+
+	FRDGTextureRef Output = nullptr;
+	const FArmASREyeHistory* PrevHistory = nullptr; // Null when there is no valid history.
+	FArmASREyeHistory* NewHistory = nullptr;
+};
+
+static FRDGTextureSRVRef CreateEyeSRV(FRDGBuilder& GraphBuilder, FRDGTextureRef Texture, int32 ArraySlice)
+{
+	if (ArraySlice != INDEX_NONE && Texture->Desc.Dimension == ETextureDimension::Texture2DArray)
+	{
+		return GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForSlice(Texture, FMath::Min<int32>(ArraySlice, Texture->Desc.ArraySize - 1)));
+	}
+	return GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(Texture));
 }
 
-UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddPasses(
+static float AddArmASREyePasses(
 	FRDGBuilder& GraphBuilder,
-	const FSceneView& View,
-	const FInputs& Inputs) const
+	const FViewInfo& PrimaryView,
+	FArmASRInfo& ArmASRInfo,
+	const FArmASRFrameSettings& Frame,
+	const FArmASREyeContext& Eye)
 {
-	using namespace UE::Renderer::Private;
-	FOutputs Outputs;
-
-	check(GMaxRHIFeatureLevel >= ERHIFeatureLevel::ES3_1);
-
-	// Check the flags specified by the user.
-	const bool bRequestedAutoExposure = static_cast<bool>(CVarArmASRAutoExposure.GetValueOnRenderThread());
-
-	const EShaderQualityPreset QualityPreset = EShaderQualityPreset(FMath::Clamp(CVarArmASRShaderQuality.GetValueOnRenderThread(), int32(EShaderQualityPreset::QUALITY), int32(EShaderQualityPreset::ULTRA_PERFORMANCE)));
-	const bool bIsQuality = (QualityPreset == EShaderQualityPreset::QUALITY);
-	const bool bIsBalancedOrPerformance = (QualityPreset == EShaderQualityPreset::BALANCED) || (QualityPreset == EShaderQualityPreset::PERFORMANCE);
-	const bool bIsPerformance = (QualityPreset == EShaderQualityPreset::PERFORMANCE);
-	const bool bIsUltraPerformance = (QualityPreset == EShaderQualityPreset::ULTRA_PERFORMANCE);
-
-	const float Sharpness = FMath::Clamp(CVarArmASRSharpness.GetValueOnRenderThread(), 0.0f, 1.0f);
+	const FViewInfo& EyeView = *Eye.EyeView;
+	const FIntPoint& InputExtents = Frame.InputExtents;
+	const FIntPoint& OutputExtents = Frame.OutputExtents;
+	const FScreenPassTextureViewport& InputViewport = Frame.InputViewport;
+	const FScreenPassTextureViewport& OutputViewport = Frame.OutputViewport;
+	const bool bIsQuality = Frame.bIsQuality;
+	const bool bIsBalancedOrPerformance = Frame.bIsBalancedOrPerformance;
+	const bool bIsPerformance = Frame.bIsPerformance;
+	const bool bIsUltraPerformance = Frame.bIsUltraPerformance;
+	const EShaderQualityPreset QualityPreset = Frame.QualityPreset;
+	const float Sharpness = Frame.Sharpness;
 	const bool bApplySharpening = (Sharpness > 0.0f);
 
-	// Check is running on GLES 3.2
-	const EPixelFormat maskFormat = IsOpenGLPlatform(GMaxRHIShaderPlatform) ? PF_R32_FLOAT : PF_R8;
+	// Side-by-side stereo: the eye does not start at the texture origin, so its colour and depth are copied
+	// to origin-aligned textures while converting the motion vectors (the FSR2 passes assume a (0,0) origin).
+	const bool bCopyInputs = (Eye.InputOffset != FIntPoint::ZeroValue);
 
-	// Setup input and output extents and viewports
-	FViewInfo& ViewInfo = (FViewInfo&)(View);
-	FIntPoint InputExtents = ViewInfo.ViewRect.Size();
-	FIntPoint OutputExtents = ViewInfo.GetSecondaryViewRectSize();
-	OutputExtents = FIntPoint(FMath::Max(InputExtents.X, OutputExtents.X), FMath::Max(InputExtents.Y, OutputExtents.Y));
-
-	FScreenPassTextureViewport InputViewport(FIntRect(0, 0, InputExtents.X, InputExtents.Y));
-	FScreenPassTextureViewport OutputViewport(FIntRect(0, 0, OutputExtents.X, OutputExtents.Y));
-
-	FIntPoint InputExtentsQuantized;
-	FIntPoint OutputExtentsQuantized;
-	QuantizeSceneBufferSize(InputExtents, InputExtentsQuantized);
-	QuantizeSceneBufferSize(OutputExtents, OutputExtentsQuantized);
-
-	FRDGTextureRef SceneColor = Inputs.SceneColor.Texture;
-	FRDGTextureRef SceneDepth = Inputs.SceneDepth.Texture;
-	FRDGTextureRef VelocityTexture = Inputs.SceneVelocity.Texture;
-	check(SceneColor);
-	check(SceneDepth);
-	check(VelocityTexture);
-
-	// Core input textures
-	FRDGTextureSRVDesc SceneColorDesc = FRDGTextureSRVDesc::Create(SceneColor);
-	FRDGTextureSRVRef SceneColorTexture = GraphBuilder.CreateSRV(SceneColorDesc);
-	FRDGTextureSRVDesc DepthDesc = FRDGTextureSRVDesc::Create(SceneDepth);
-	FRDGTextureSRVRef DepthTexture = GraphBuilder.CreateSRV(DepthDesc);
-	FRDGTextureSRVDesc MotionVectorDesc = FRDGTextureSRVDesc::Create(VelocityTexture);
-
-	// Create the output texture and assign it to Outputs. This will be updated in the Accumulate or RCAS shader.
-	FRDGTextureDesc OutputColorDesc = Inputs.SceneColor.Texture->Desc;
-	OutputColorDesc.Extent = OutputExtents;
-	OutputColorDesc.Flags = TexCreate_ShaderResource | TexCreate_RenderTargetable;
-	Outputs.FullRes.Texture = GraphBuilder.CreateTexture(
-		OutputColorDesc,
-		TEXT("ArmASROutputSceneColor"),
-		ERDGTextureFlags::MultiFrame);
-	Outputs.FullRes.ViewRect = Inputs.OutputViewRect;
+	FRDGTextureSRVRef SceneColorTexture = CreateEyeSRV(GraphBuilder, Eye.SceneColor, Eye.ArraySlice);
+	FRDGTextureSRVRef DepthTexture = CreateEyeSRV(GraphBuilder, Eye.SceneDepth, Eye.ArraySlice);
+	FRDGTextureSRVRef VelocitySRV = CreateEyeSRV(GraphBuilder, Eye.SceneVelocity, Eye.ArraySlice);
+	FIntPoint ColorResourceDimensions = Eye.SceneColor->Desc.Extent;
 
 	// Get previous history. These textures will be used as inputs for some of the shaders.
 	FRDGTextureRef PrevUpscaledColour{ nullptr };
 	FRDGTextureRef PrevInternalReactive{ nullptr };
 	FRDGTextureRef PrevLumaHistory{ nullptr };
 	FRDGTextureRef PrevDilatedMotionVectors{ nullptr };
-	FRDGTextureRef PrevDilatedDepthMotionVectorsInputLuma{nullptr};
+	FRDGTextureRef PrevDilatedDepthMotionVectorsInputLuma{ nullptr };
 	FRDGTextureRef PrevLockStatus{ nullptr };
 	FRDGTextureRef NewLock{ nullptr };
-	float PrevPreExposure{ 0.0 };
 
-	FArmASRTemporalAAHistory* PrevHistory = static_cast<FArmASRTemporalAAHistory*>(Inputs.PrevHistory.GetReference());
-
-	// Check for camera cuts and a valid history.
-	bool bCameraCut = View.bCameraCut || !ViewInfo.ViewState;
-	bool ValidHistory = PrevHistory && PrevHistory->IsValid(QualityPreset) && !bCameraCut;
+	const FArmASREyeHistory* PrevHistory = Eye.PrevHistory;
+	const bool ValidHistory = (PrevHistory != nullptr);
 
 	if (ValidHistory)
 	{
@@ -405,10 +440,9 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		if (!PrevHistory->NewLock.IsValid())
 		{
 			FRDGTextureDesc LockMaskDesc =
-				FRDGTextureDesc::Create2D(OutputExtents, maskFormat, FClearValueBinding::Black,
+				FRDGTextureDesc::Create2D(OutputExtents, Frame.MaskFormat, FClearValueBinding::Black,
 										  TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable, 1, 1);
 			NewLock = GraphBuilder.CreateTexture(LockMaskDesc, TEXT("LockMaskTexture"));
-
 		}
 		else
 		{
@@ -425,7 +459,6 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		}
 
 		PrevLockStatus = GraphBuilder.RegisterExternalTexture(PrevHistory->LockStatus, TEXT("PrevLockStatus"));
-		PrevPreExposure = PrevHistory->PreExposure;
 	}
 	else
 	{
@@ -438,26 +471,24 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 
 		// Create New Lock texture.
 		FRDGTextureDesc LockMaskDesc =
-			FRDGTextureDesc::Create2D(OutputExtents, maskFormat, FClearValueBinding::Black,
+			FRDGTextureDesc::Create2D(OutputExtents, Frame.MaskFormat, FClearValueBinding::Black,
 									  TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable, 1, 1);
 		NewLock = GraphBuilder.CreateTexture(LockMaskDesc, TEXT("LockMaskTexture"));
-
-		// Reset the frame index.
-		FRAME_INDEX = 0;
 	}
 	AddClearRenderTargetPass(GraphBuilder, NewLock);
 
 	FRDGTextureRef ReactiveMaskTexture = nullptr;
 	FRDGTextureRef CompositeMaskTexture = nullptr;
 
-	if (!bIsUltraPerformance && CVarArmASRCreateReactiveMask.GetValueOnRenderThread() &&
+	// The reactive mask reads the GBuffer of the primary view at (0,0), so it is only used for mono rendering.
+	if (!bIsUltraPerformance && Frame.bAllowReactiveMask && CVarArmASRCreateReactiveMask.GetValueOnRenderThread() &&
 		ArmASRInfo.PostInputs.SceneTextures)
 	{
 		FRDGTextureDesc ReactiveMaskDesc =
-			FRDGTextureDesc::Create2D(InputExtents, maskFormat, FClearValueBinding::Black,
+			FRDGTextureDesc::Create2D(InputExtents, Frame.MaskFormat, FClearValueBinding::Black,
 									  TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
 		FRDGTextureDesc CompositeMaskDesc =
-			FRDGTextureDesc::Create2D(InputExtents, maskFormat, FClearValueBinding::Black,
+			FRDGTextureDesc::Create2D(InputExtents, Frame.MaskFormat, FClearValueBinding::Black,
 									  TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
 
 		ReactiveMaskTexture = GraphBuilder.CreateTexture(ReactiveMaskDesc, TEXT("ArmASRReactiveMaskTexture"));
@@ -469,14 +500,14 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 			InputViewport.Rect,
 			ReactiveMaskTexture,
 			CompositeMaskTexture,
-			SceneDepth,
-			SceneColor,
-			VelocityTexture,
+			Eye.SceneDepth,
+			Eye.SceneColor,
+			Eye.SceneVelocity,
 			ValidHistory,
-			View);
-		TShaderMapRef<FArmASRCreateReactiveMaskPS> ReactiveMaskShader(ViewInfo.ShaderMap);
+			PrimaryView);
+		TShaderMapRef<FArmASRCreateReactiveMaskPS> ReactiveMaskShader(PrimaryView.ShaderMap);
 		FPixelShaderUtils::AddFullscreenPass(
-			GraphBuilder, ViewInfo.ShaderMap,
+			GraphBuilder, PrimaryView.ShaderMap,
 			RDG_EVENT_NAME("Create Reactive Mask (PS)"),
 			ReactiveMaskShader,
 			PassParameters,
@@ -489,23 +520,39 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	}
 
 	// Convert Motion Vectors texture to R16G16_Float, so they can be used correctly by the shaders.
-	FRDGTextureDesc MotionVectorDescNew = FRDGTextureDesc::Create2D(InputExtentsQuantized, PF_G16R16F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+	FRDGTextureDesc MotionVectorDescNew = FRDGTextureDesc::Create2D(Frame.InputExtentsQuantized, PF_G16R16F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
 	FRDGTextureRef MotionVectorTextureNew = GraphBuilder.CreateTexture(MotionVectorDescNew, TEXT("ArmASRMotionVectorTexture"));
 	{
 		FArmASRConvertVelocity::FParameters* ConvertVelocityParameters = GraphBuilder.AllocParameters<FArmASRConvertVelocity::FParameters>();
 
-		FRDGTextureUAVDesc OutputDesc(MotionVectorTextureNew);
-		ConvertVelocityParameters->DepthTexture = SceneDepth;
-		ConvertVelocityParameters->InputDepth = GraphBuilder.CreateSRV(DepthDesc);
-		ConvertVelocityParameters->InputVelocity = GraphBuilder.CreateSRV(MotionVectorDesc);
-		ConvertVelocityParameters->View = View.ViewUniformBuffer;
+		ConvertVelocityParameters->InputDepth = DepthTexture;
+		ConvertVelocityParameters->InputVelocity = VelocitySRV;
+		ConvertVelocityParameters->InputOffset = Eye.InputOffset;
+		ConvertVelocityParameters->View = EyeView.ViewUniformBuffer;
+		ConvertVelocityParameters->RenderTargets[0] = FRenderTargetBinding(MotionVectorTextureNew, ERenderTargetLoadAction::ENoAction);
 
-		const FScreenPassRenderTarget MotionVectorNewRT(MotionVectorTextureNew, InputViewport.Rect, ERenderTargetLoadAction::ENoAction);
-		ConvertVelocityParameters->RenderTargets[0] = MotionVectorNewRT.GetRenderTargetBinding();
+		if (bCopyInputs)
+		{
+			const FRDGTextureDesc ColorCopyDesc = FRDGTextureDesc::Create2D(Frame.InputExtentsQuantized, Eye.SceneColor->Desc.Format, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_RenderTargetable);
+			const FRDGTextureDesc DepthCopyDesc = FRDGTextureDesc::Create2D(Frame.InputExtentsQuantized, PF_R32_FLOAT, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_RenderTargetable);
+			FRDGTextureRef ColorCopy = GraphBuilder.CreateTexture(ColorCopyDesc, TEXT("ArmASRInputColorCopy"));
+			FRDGTextureRef DepthCopy = GraphBuilder.CreateTexture(DepthCopyDesc, TEXT("ArmASRInputDepthCopy"));
 
-		TShaderMapRef<FArmASRConvertVelocity> ConvertVelocityShader(ViewInfo.ShaderMap);
+			ConvertVelocityParameters->InputColor = SceneColorTexture;
+			ConvertVelocityParameters->RenderTargets[1] = FRenderTargetBinding(ColorCopy, ERenderTargetLoadAction::ENoAction);
+			ConvertVelocityParameters->RenderTargets[2] = FRenderTargetBinding(DepthCopy, ERenderTargetLoadAction::ENoAction);
+
+			// The remaining passes read the origin-aligned copies.
+			SceneColorTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(ColorCopy));
+			DepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(DepthCopy));
+			ColorResourceDimensions = ColorCopyDesc.Extent;
+		}
+
+		FArmASRConvertVelocity::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FArmASR_CopyInputs>(bCopyInputs);
+		TShaderMapRef<FArmASRConvertVelocity> ConvertVelocityShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
-			GraphBuilder, ViewInfo.ShaderMap,
+			GraphBuilder, PrimaryView.ShaderMap,
 			RDG_EVENT_NAME("ConvertVelocity (PS)"),
 			ConvertVelocityShader,
 			ConvertVelocityParameters,
@@ -514,11 +561,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 
 	// Setup common parameters
 	FArmASRPassParameters* ArmASRPassParameters = GraphBuilder.AllocParameters<FArmASRPassParameters>();
-	const FIntPoint& ResourceDimensions = SceneColor->Desc.Extent;
-	SetCommonParameters(ArmASRPassParameters, FRAME_INDEX, PrevPreExposure, InputExtents, OutputExtents, ViewInfo, ResourceDimensions);
-
-	// Update frame index for next frame.
-	FRAME_INDEX = (FRAME_INDEX + 1);
+	SetCommonParameters(ArmASRPassParameters, Frame.FrameIndex, Frame.PrevPreExposure, InputExtents, OutputExtents, EyeView, ColorResourceDimensions);
 
 	// Assign common parameters to buffer.
 	TUniformBufferRef<FArmASRPassParameters> ArmASRPassParametersBuffer = TUniformBufferRef<FArmASRPassParameters>::CreateUniformBufferImmediate(*ArmASRPassParameters, UniformBuffer_SingleDraw);
@@ -541,11 +584,11 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 			ArmASRInfo);
 
 		FArmASRComputeLuminancePyramidCS::FPermutationDomain PermutationVector;
-		const ERHIFeatureSupport WaveOpsSupport = FDataDrivenShaderPlatformInfo::GetSupportsWaveOperations(View.GetShaderPlatform());
+		const ERHIFeatureSupport WaveOpsSupport = FDataDrivenShaderPlatformInfo::GetSupportsWaveOperations(PrimaryView.GetShaderPlatform());
 		const bool bUseWaveOps = (WaveOpsSupport == ERHIFeatureSupport::RuntimeGuaranteed) ||
 								 (WaveOpsSupport == ERHIFeatureSupport::RuntimeDependent && GRHISupportsWaveOperations);
 		PermutationVector.Set<FArmASR_UseWaveOps>(bUseWaveOps);
-		TShaderMapRef<FArmASRComputeLuminancePyramidCS> ClpShader(ViewInfo.ShaderMap, PermutationVector);
+		TShaderMapRef<FArmASRComputeLuminancePyramidCS> ClpShader(PrimaryView.ShaderMap, PermutationVector);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
 			RDG_EVENT_NAME("Compute Luminance Pyramid (CS)"),
@@ -557,27 +600,10 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 
 	// If AutoExposure is enabled use Exposure generated from Compute Luminance shader, otherwise use Engine exposure.
 	// As UltraPerformance preset removes Compute Luminance Pass, it always uses Engine exposure.
-	FRDGTextureRef ExposureTexture = nullptr;
-	if (bRequestedAutoExposure && !bIsUltraPerformance)
-	{
-		ExposureTexture = ClpShaderParameters->rw_auto_exposure->Desc.Texture;
-	}
-	else
-	{
-		// Setup and run shader to get exposure from Unreal Engine.
-		FArmASRCopyExposureCS::FParameters* CopyExposureParameters = GraphBuilder.AllocParameters<FArmASRCopyExposureCS::FParameters>();
-		SetCopyExposureParameters(CopyExposureParameters, View, GraphBuilder);
-
-		TShaderMapRef<FArmASRCopyExposureCS> CopyExposureShader(ViewInfo.ShaderMap);
-		FComputeShaderUtils::AddPass(
-			GraphBuilder,
-			RDG_EVENT_NAME("CopyExposure (CS)"),
-			CopyExposureShader,
-			CopyExposureParameters,
-			FComputeShaderUtils::GetGroupCount(FIntVector(1, 1, 1), FIntVector(1, 1, 1))
-		);
-		ExposureTexture = CopyExposureParameters->ExposureTexture->Desc.Texture;
-	}
+	FRDGTextureRef ExposureTexture = (Frame.bRequestedAutoExposure && !bIsUltraPerformance)
+		? ClpShaderParameters->rw_auto_exposure->Desc.Texture
+		: Frame.EngineExposureTexture;
+	check(ExposureTexture);
 
 	// Create Exposure SRV texture once and pass to other shaders.
 	FRDGTextureSRVDesc AutoExposureDesc = FRDGTextureSRVDesc::Create(ExposureTexture);
@@ -602,9 +628,9 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		// Create shader and add pass.
 		FArmASRReconstructPrevDepthPS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FArmASR_ApplyUltraPerfOpt>(bIsUltraPerformance);
-		TShaderMapRef<FArmASRReconstructPrevDepthPS> RpdShader(ViewInfo.ShaderMap, PermutationVector);
+		TShaderMapRef<FArmASRReconstructPrevDepthPS> RpdShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
-			GraphBuilder, ViewInfo.ShaderMap,
+			GraphBuilder, PrimaryView.ShaderMap,
 			RDG_EVENT_NAME("Reconstruct Previous Depth (PS)"),
 			RpdShader,
 			RpdShaderParameters,
@@ -643,9 +669,9 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		PermutationVector.Set<FArmASR_ApplyBalancedOpt>(bIsBalancedOrPerformance);
 		PermutationVector.Set<FArmASR_ApplyPerfOpt>(bIsPerformance);
 		PermutationVector.Set<FArmASR_ApplyUltraPerfOpt>(bIsUltraPerformance);
-		TShaderMapRef<FArmASRDepthClipPS> DcShader(ViewInfo.ShaderMap, PermutationVector);
+		TShaderMapRef<FArmASRDepthClipPS> DcShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
-			GraphBuilder, ViewInfo.ShaderMap,
+			GraphBuilder, PrimaryView.ShaderMap,
 			RDG_EVENT_NAME("Depth Clip (PS)"),
 			DcShader,
 			DcShaderParameters,
@@ -669,13 +695,13 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		);
 		FArmASRLockCS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FArmASR_ApplyUltraPerfOpt>(bIsUltraPerformance);
-		TShaderMapRef<FArmASRLockCS> LShader(ViewInfo.ShaderMap, PermutationVector);
+		TShaderMapRef<FArmASRLockCS> LShader(PrimaryView.ShaderMap, PermutationVector);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
 			RDG_EVENT_NAME("Lock (CS)"),
 			LShader,
 			LShaderParameters,
-			FComputeShaderUtils::GetGroupCount(Inputs.SceneColor.ViewRect.Size(), FComputeShaderUtils::kGolden2DGroupSize)
+			FComputeShaderUtils::GetGroupCount(InputExtents, FComputeShaderUtils::kGolden2DGroupSize)
 		);
 	}
 
@@ -695,7 +721,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 			DcShaderParameters->RenderTargets[1].GetTexture(), // Prepared input colour is generated from Depth clip
 			SceneColorTexture,
 			PrevLockStatus,
-			Outputs.FullRes.Texture,
+			Eye.Output,
 			MotionVectorTextureNew,
 			PrevUpscaledColour,
 			PrevLumaHistory,
@@ -705,7 +731,8 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 			QualityPreset,
 			OutputExtents,
 			OutputViewport.Rect,
-			GraphBuilder);
+			GraphBuilder,
+			Eye.ArraySlice);
 
 		FArmASRAccumulatePS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FArmASR_DoSharpening>(bApplySharpening);
@@ -714,9 +741,9 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		PermutationVector.Set<FArmASR_ApplyPerfOpt>(bIsPerformance ? 1 : 0);
 		PermutationVector.Set<FArmASR_ApplyUltraPerfOpt>(bIsUltraPerformance ? 1 : 0);
 
-		TShaderMapRef<FArmASRAccumulatePS> AccumulateShader(ViewInfo.ShaderMap, PermutationVector);
+		TShaderMapRef<FArmASRAccumulatePS> AccumulateShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
-			GraphBuilder, ViewInfo.ShaderMap,
+			GraphBuilder, PrimaryView.ShaderMap,
 			RDG_EVENT_NAME("Accumulate (PS)"),
 			AccumulateShader,
 			AccumulateParameters,
@@ -724,7 +751,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	}
 
 	// Add RCAS if necessary
-	if (Sharpness > 0.0f)
+	if (bApplySharpening)
 	{
 		FArmASRRCASPS::FParameters* RcasParameters = GraphBuilder.AllocParameters<FArmASRRCASPS::FParameters>();
 		FArmASRRCASParameters* rcasPassParameters = GraphBuilder.AllocParameters<FArmASRRCASParameters>();
@@ -734,14 +761,15 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 			ArmASRPassParametersBuffer,
 			ExposureTexture,
 			AccumulateParameters->RenderTargets[0].GetTexture(),
-			Outputs.FullRes.Texture,
+			Eye.Output,
 			Sharpness,
 			OutputViewport.Rect,
-			GraphBuilder);
+			GraphBuilder,
+			Eye.ArraySlice);
 
-		TShaderMapRef<FArmASRRCASPS> RcasShader(ViewInfo.ShaderMap);
+		TShaderMapRef<FArmASRRCASPS> RcasShader(PrimaryView.ShaderMap);
 		FPixelShaderUtils::AddFullscreenPass(
-			GraphBuilder, ViewInfo.ShaderMap,
+			GraphBuilder, PrimaryView.ShaderMap,
 			RDG_EVENT_NAME("RCAS (PS)"),
 			RcasShader,
 			RcasParameters,
@@ -749,13 +777,12 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	}
 
 	// Set up new history
-	TRefCountPtr<FArmASRTemporalAAHistory> NewHistory(new FArmASRTemporalAAHistory());
+	FArmASREyeHistory* NewHistory = Eye.NewHistory;
 
 	if (!bIsQuality)
 	{
 		NewHistory->LumaHistory = nullptr;
-		const int32 TemporalReactiveIdx = (!bIsQuality) ? 1 : -1;
-		FRDGTextureRef TemporalReactiveTexture = AccumulateParameters->RenderTargets[TemporalReactiveIdx].GetTexture();
+		FRDGTextureRef TemporalReactiveTexture = AccumulateParameters->RenderTargets[1].GetTexture();
 		GraphBuilder.QueueTextureExtraction(TemporalReactiveTexture, &NewHistory->InternalReactive);
 	}
 	else
@@ -780,7 +807,151 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	{
 		GraphBuilder.QueueTextureExtraction(DilatedMotionVectorTexture, &NewHistory->DilatedMotionVectors);
 	}
-	NewHistory->PreExposure = ArmASRPassParameters->fPreExposure;
+
+	return ArmASRPassParameters->fPreExposure;
+}
+
+FArmASRTemporalUpscaler::FArmASRTemporalUpscaler(FArmASRInfo& ArmASRInfo, FArmASRPassthroughDenoiser& Denoiser)
+	: ArmASRInfo(ArmASRInfo), Denoiser(Denoiser)
+{
+	GEngine->GetDynamicResolutionCurrentStateInfos(DynamicResolutionStateInfos);
+	FFXSystemInterface::RegisterCustomFXSystem(
+		ArmASRFXSystem::FXName,
+		// There is no guarantee that the FArmASRTemporalUpscaler is alive when this lambda is called.
+		// but the ArmASRInfo should be alive, so use that directly rather than passing the Upscaler.
+		FCreateCustomFXSystemDelegate::CreateLambda([&ArmASRInfo](ERHIFeatureLevel::Type InFeatureLevel, EShaderPlatform InShaderPlatform, FGPUSortManager* InGPUSortManager) -> FFXSystemInterface*
+			{
+				return new ArmASRFXSystem(ArmASRInfo, InGPUSortManager);
+			}));
+}
+
+FArmASRTemporalUpscaler::~FArmASRTemporalUpscaler()
+{
+}
+
+const TCHAR* FArmASRTemporalUpscaler::GetDebugName() const
+{
+	return ArmASRUpscalerName;
+}
+
+UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddPasses(
+	FRDGBuilder& GraphBuilder,
+	const FSceneView& View,
+	const FInputs& Inputs) const
+{
+	using namespace UE::Renderer::Private;
+	FOutputs Outputs;
+
+	check(GMaxRHIFeatureLevel >= ERHIFeatureLevel::ES3_1);
+
+	FArmASRFrameSettings Frame;
+
+	// Check the flags specified by the user.
+	Frame.bRequestedAutoExposure = static_cast<bool>(CVarArmASRAutoExposure.GetValueOnRenderThread());
+
+	Frame.QualityPreset = EShaderQualityPreset(FMath::Clamp(CVarArmASRShaderQuality.GetValueOnRenderThread(), int32(EShaderQualityPreset::QUALITY), int32(EShaderQualityPreset::ULTRA_PERFORMANCE)));
+	Frame.bIsQuality = (Frame.QualityPreset == EShaderQualityPreset::QUALITY);
+	Frame.bIsBalancedOrPerformance = (Frame.QualityPreset == EShaderQualityPreset::BALANCED) || (Frame.QualityPreset == EShaderQualityPreset::PERFORMANCE);
+	Frame.bIsPerformance = (Frame.QualityPreset == EShaderQualityPreset::PERFORMANCE);
+	Frame.bIsUltraPerformance = (Frame.QualityPreset == EShaderQualityPreset::ULTRA_PERFORMANCE);
+
+	Frame.Sharpness = FMath::Clamp(CVarArmASRSharpness.GetValueOnRenderThread(), 0.0f, 1.0f);
+
+	// Check is running on GLES 3.2
+	Frame.MaskFormat = IsOpenGLPlatform(GMaxRHIShaderPlatform) ? PF_R32_FLOAT : PF_R8;
+
+	// Setup input and output extents and viewports
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	Frame.InputExtents = Inputs.SceneColor.ViewRect.Size();
+	FIntPoint OutputExtents = Inputs.OutputViewRect.Size();
+	Frame.OutputExtents = FIntPoint(FMath::Max(Frame.InputExtents.X, OutputExtents.X), FMath::Max(Frame.InputExtents.Y, OutputExtents.Y));
+
+	Frame.InputViewport = FScreenPassTextureViewport(FIntRect(0, 0, Frame.InputExtents.X, Frame.InputExtents.Y));
+	Frame.OutputViewport = FScreenPassTextureViewport(FIntRect(0, 0, Frame.OutputExtents.X, Frame.OutputExtents.Y));
+	QuantizeSceneBufferSize(Frame.InputExtents, Frame.InputExtentsQuantized);
+
+	FRDGTextureRef SceneColor = Inputs.SceneColor.Texture;
+	FRDGTextureRef SceneDepth = Inputs.SceneDepth.Texture;
+	FRDGTextureRef VelocityTexture = Inputs.SceneVelocity.Texture;
+	check(SceneColor);
+	check(SceneDepth);
+	check(VelocityTexture);
+
+	// Stereo setup.
+	// - Multiview: this is the primary view, both eyes live in the slices of 2-slice texture arrays and the
+	//   secondary eye's matrices come from the instanced view. The output is a texture array as well.
+	// - Side-by-side: AddPasses is called once per eye with that eye's view; its view rect may not start at (0,0).
+	const bool bMultiView = ViewInfo.bIsMobileMultiViewEnabled && SceneColor->Desc.Dimension == ETextureDimension::Texture2DArray;
+	const FViewInfo* SecondEyeView = bMultiView ? ViewInfo.GetInstancedView() : nullptr;
+	const int32 NumEyes = (SecondEyeView && SceneColor->Desc.ArraySize >= ArmASRMaxEyes) ? ArmASRMaxEyes : 1;
+	const bool bIsStereo = bMultiView || IStereoRendering::IsStereoEyeView(View);
+	Frame.bAllowReactiveMask = !bIsStereo;
+
+	// Create the output texture and assign it to Outputs. This will be updated in the Accumulate or RCAS shader.
+	// Copying the scene colour description keeps the array layout for multiview.
+	FRDGTextureDesc OutputColorDesc = SceneColor->Desc;
+	OutputColorDesc.Extent = Frame.OutputExtents;
+	OutputColorDesc.NumMips = 1;
+	OutputColorDesc.NumSamples = 1;
+	OutputColorDesc.Flags = TexCreate_ShaderResource | TexCreate_RenderTargetable;
+	if (bMultiView)
+	{
+		// Each eye writes its own slice.
+		OutputColorDesc.Flags |= TexCreate_TargetArraySlicesIndependently;
+	}
+	Outputs.FullRes.Texture = GraphBuilder.CreateTexture(
+		OutputColorDesc,
+		TEXT("ArmASROutputSceneColor"),
+		ERDGTextureFlags::MultiFrame);
+	Outputs.FullRes.ViewRect = Inputs.OutputViewRect;
+
+	// Check for camera cuts and a valid history.
+	const FArmASRTemporalAAHistory* PrevHistory = static_cast<const FArmASRTemporalAAHistory*>(Inputs.PrevHistory.GetReference());
+	const bool bCameraCut = View.bCameraCut || !ViewInfo.ViewState;
+	const bool ValidHistory = PrevHistory && !bCameraCut && PrevHistory->IsValid(Frame.QualityPreset, NumEyes, Frame.OutputExtents);
+
+	Frame.FrameIndex = ValidHistory ? (PrevHistory->FrameIndex + 1) : 0;
+	Frame.PrevPreExposure = ValidHistory ? PrevHistory->PreExposure : 0.0f;
+
+	// Engine exposure is the same for both eyes, copy it once.
+	if (!Frame.bRequestedAutoExposure || Frame.bIsUltraPerformance)
+	{
+		FArmASRCopyExposureCS::FParameters* CopyExposureParameters = GraphBuilder.AllocParameters<FArmASRCopyExposureCS::FParameters>();
+		SetCopyExposureParameters(CopyExposureParameters, View, GraphBuilder);
+
+		TShaderMapRef<FArmASRCopyExposureCS> CopyExposureShader(ViewInfo.ShaderMap);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("CopyExposure (CS)"),
+			CopyExposureShader,
+			CopyExposureParameters,
+			FComputeShaderUtils::GetGroupCount(FIntVector(1, 1, 1), FIntVector(1, 1, 1))
+		);
+		Frame.EngineExposureTexture = CopyExposureParameters->ExposureTexture->Desc.Texture;
+	}
+
+	TRefCountPtr<FArmASRTemporalAAHistory> NewHistory(new FArmASRTemporalAAHistory());
+	NewHistory->NumEyes = NumEyes;
+	NewHistory->OutputExtents = Frame.OutputExtents;
+	NewHistory->FrameIndex = Frame.FrameIndex;
+
+	for (int32 EyeIndex = 0; EyeIndex < NumEyes; ++EyeIndex)
+	{
+		RDG_EVENT_SCOPE_CONDITIONAL(GraphBuilder, NumEyes > 1, "ArmASR Eye%d", EyeIndex);
+
+		FArmASREyeContext Eye;
+		Eye.EyeView = (EyeIndex == 0) ? &ViewInfo : SecondEyeView;
+		Eye.SceneColor = SceneColor;
+		Eye.SceneDepth = SceneDepth;
+		Eye.SceneVelocity = VelocityTexture;
+		Eye.ArraySlice = bMultiView ? EyeIndex : INDEX_NONE;
+		Eye.InputOffset = bMultiView ? FIntPoint::ZeroValue : Inputs.SceneColor.ViewRect.Min;
+		Eye.Output = Outputs.FullRes.Texture;
+		Eye.PrevHistory = ValidHistory ? &PrevHistory->Eyes[EyeIndex] : nullptr;
+		Eye.NewHistory = &NewHistory->Eyes[EyeIndex];
+
+		NewHistory->PreExposure = AddArmASREyePasses(GraphBuilder, ViewInfo, ArmASRInfo, Frame, Eye);
+	}
 
 	Outputs.NewHistory = NewHistory;
 
@@ -839,13 +1010,15 @@ public:
 			return;
 		}
 
-		// Only support a single view now as there is state
-		if (ViewFamily.Views.Num() != 1)
+		// Mono, or a stereo (VR) pair of views. Each view keeps its history in its own view state; with
+		// mobile multiview only the primary view runs the upscaler and it processes both eyes.
+		const bool bIsStereoFamily = ViewFamily.Views.Num() == 2 && IStereoRendering::IsStereoEyeView(*ViewFamily.Views[0]);
+		if (ViewFamily.Views.Num() != 1 && !bIsStereoFamily)
 		{
 			static bool AlreadyLogged = false;
 			if (!AlreadyLogged)
 			{
-				UE_LOG(LogArmASR, Warning, TEXT("Arm ASR does not support multiple views. Disabling Arm ASR."));
+				UE_LOG(LogArmASR, Warning, TEXT("Arm ASR only supports a single view or a stereo pair of views. Disabling Arm ASR."));
 				AlreadyLogged = true;
 			}
 			return;

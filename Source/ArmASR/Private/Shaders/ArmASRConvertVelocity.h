@@ -27,16 +27,21 @@
 #include "ShaderParameterStruct.h"
 #include "SceneTextureParameters.h"
 
+class FArmASR_CopyInputs : SHADER_PERMUTATION_BOOL("ARMASR_COPY_INPUTS");
+
 class FArmASRConvertVelocity : public FGlobalShader
 {
 public:
 	DECLARE_GLOBAL_SHADER(FArmASRConvertVelocity);
 	SHADER_USE_PARAMETER_STRUCT(FArmASRConvertVelocity, FGlobalShader);
 
+	using FPermutationDomain = TShaderPermutationDomain<FArmASR_CopyInputs>;
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		RDG_TEXTURE_ACCESS(DepthTexture, ERHIAccess::SRVGraphics)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputDepth)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputVelocity)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputColor)
+		SHADER_PARAMETER(FIntPoint, InputOffset)
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
