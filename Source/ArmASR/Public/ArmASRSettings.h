@@ -7,6 +7,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
+#include "Engine/EngineTypes.h"
 #include "ArmASR.h"
 #include "ArmASRSettings.generated.h"
 
@@ -169,7 +170,7 @@ public:
 		DisplayName = "Reactive Shading Model",
 		ToolTip = "Treat the specified shading model as reactive, taking the CustomData0.x value as the reactive value to write into the mask.",
 		EditCondition = "EnableArmASR"))
-	TEnumAsByte<enum EMaterialShadingModel> ArmASRReactiveShadingModelID;
+	TEnumAsByte<EMaterialShadingModel> ArmASRReactiveShadingModelID;
 
 private:
 	IConsoleVariable *CVSetFromUI = nullptr;
