@@ -47,6 +47,13 @@ public:
 		EditCondition = "EnableArmASR"))
 	bool ArmASRAutoExposure;
 
+	UPROPERTY(EditAnywhere, Config, Category = GeneralSettings, meta = (
+		ConsoleVariable = "r.ArmASR.MobileUpscale",
+		DisplayName = "Mobile Upscale (requires engine patch)",
+		ToolTip = "Mobile renderer only, requires the Arm ASR engine patch (EnginePatch folder). Disables the tonemap subpass so the post-process chain runs Arm ASR (Mobile HDR), and allows rendering at r.ScreenPercentage then upscaling with Arm ASR without post-processing (Mobile LDR). Has no effect on an unpatched engine.",
+		EditCondition = "EnableArmASR"))
+	bool ArmASRMobileUpscale;
+
 	UPROPERTY(EditAnywhere, Config, Category = QualitySettings, meta = (
 		ConsoleVariable = "r.ArmASR.Sharpness",
 		DisplayName = "Sharpness",

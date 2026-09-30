@@ -12,7 +12,7 @@
 class FArmASRReconstructPrevDepthPS : public FGlobalShader
 {
 public:
-	using FPermutationDomain = TShaderPermutationDomain<FArmASR_ApplyUltraPerfOpt>;
+	using FPermutationDomain = TShaderPermutationDomain<FArmASR_ApplyUltraPerfOpt, FArmASR_LDRInput>;
 
 	DECLARE_GLOBAL_SHADER(FArmASRReconstructPrevDepthPS);
 	SHADER_USE_PARAMETER_STRUCT(FArmASRReconstructPrevDepthPS, FGlobalShader);
@@ -29,6 +29,12 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
+		// LDR scene colour only exists on the mobile renderer.
+		const FPermutationDomain PermutationVector(Parameters.PermutationId);
+		if (PermutationVector.Get<FArmASR_LDRInput>() && !IsMobilePlatform(Parameters.Platform))
+		{
+			return false;
+		}
 		return FArmASRGlobalShader::ShouldCompilePermutation(Parameters);
 	}
 

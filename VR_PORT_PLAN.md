@@ -16,7 +16,8 @@ Ensuite : UE 5.8, puis évaluation du mobile deferred sur Quest.
 | Test sur casque (LDR multiview, HDR multiview, side-by-side) | ⏳ à faire |
 | Mesures de perf vs MSAA 4x | ⏳ à faire |
 | Motion vectors AppSpaceWarp comme source de vélocité (éviter la passe de vélocité UE) | 💡 piste |
-| Exposition fixe à 1.0 en LDR, entrée couleur non-HDR (`FFXM_FSR2_OPTION_HDR_COLOR_INPUT=0`) | 💡 optimisation |
+| Exposition fixe à 1.0 en LDR, permutation `ARMASR_LDR_INPUT` (sans tonemap HDR) | ✅ codé, compile |
+| CVar `r.ArmASR.MobileUpscale` dans les Project Settings | ✅ |
 | Portage UE 5.8 (plugin + ancres du patch moteur) | ⏳ après validation 5.5 |
 | Mobile deferred sur Quest (réactiver le reactive mask GBuffer) | ⏳ selon perf |
 

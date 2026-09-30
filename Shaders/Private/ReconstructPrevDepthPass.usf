@@ -4,4 +4,11 @@
 //
 #include "/Engine/Public/Platform.ush"
 
+// LDR input (Mobile LDR): skip the HDR tonemap / inverse tonemap around accumulation.
+#ifndef ARMASR_LDR_INPUT
+#define ARMASR_LDR_INPUT 0
+#endif
+#define FFXM_FSR2_OPTION_HDR_COLOR_INPUT (ARMASR_LDR_INPUT ? 0 : 1)
+
+
 #include "/ThirdParty/ArmASR/ffxm_fsr2_reconstruct_previous_depth_pass_fs.hlsl"

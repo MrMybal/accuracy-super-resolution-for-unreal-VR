@@ -56,7 +56,7 @@ void FArmASRGlobalShader::ModifyCompilationEnvironment(const FGlobalShaderPermut
 
 	OutEnvironment.SetDefine(TEXT("FFXM_HLSL_6_2"), bUsingSM6);
 
-	OutEnvironment.SetDefine(TEXT("FFXM_FSR2_OPTION_HDR_COLOR_INPUT"), 1);
+	// FFXM_FSR2_OPTION_HDR_COLOR_INPUT is defined by the pass entry files from the ARMASR_LDR_INPUT permutation.
 	OutEnvironment.SetDefine(TEXT("FFXM_FSR2_OPTION_LOW_RESOLUTION_MOTION_VECTORS"), 1);
 	OutEnvironment.SetDefine(TEXT("FFXM_FSR2_OPTION_JITTERED_MOTION_VECTORS"), 0);
 	OutEnvironment.SetDefine(TEXT("FFXM_FSR2_OPTION_INVERTED_DEPTH"), 1);

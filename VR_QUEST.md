@@ -14,7 +14,10 @@ avec Arm ASR (upscaling temporel). L'anti-aliasing temporel de l'upscaler rempla
   copiées vers des textures alignées pendant la conversion des motion vectors.
 - **Historique par œil** (le compteur de frames global a été supprimé, il est maintenant dans l'historique).
 - Reactive mask désactivé en stéréo (il lit la GBuffer de la vue principale, inexistante en forward).
-- Nouvelle CVar `r.ArmASR.MobileUpscale` (lue par le patch moteur, voir plus bas).
+- Nouvelle CVar `r.ArmASR.MobileUpscale` (lue par le patch moteur, voir plus bas), aussi réglable dans
+  `Project Settings > Plugins > Arm ASR > Mobile Upscale (requires engine patch)`.
+- **Mode LDR détecté automatiquement** (mobile + `r.MobileHDR=False`) : exposition fixée à 1.0 (pas d'eye adaptation en LDR)
+  et variantes de shaders sans tonemapping HDR autour de l'accumulation (Accumulate, Reconstruct Previous Depth) : moins d'ALU.
 
 ## Pourquoi un patch moteur
 
@@ -96,8 +99,7 @@ r.MobileHDR=False                 ; mode LDR
   n'est pas utilisé (autre format, autre résolution).
 - **Foveated rendering (FDM)** : non pris en compte par l'upscaler. La densité variable réduit la qualité en périphérie
   mais ne casse pas les coordonnées.
-- **Exposition en LDR** : l'upscaler lit l'eye adaptation du moteur (normalement 1.0 en LDR).
-  Si l'image est trop sombre ou trop claire, essayer `r.ArmASR.AutoExposure 1` pour comparer.
+- **Exposition en LDR** : fixée à 1.0 par le plugin. `r.ArmASR.AutoExposure 1` reste possible pour comparer.
 - **Tonemap subpass** : le patch le désactive globalement quand `r.ArmASR.MobileUpscale=1`. En HDR, le tonemapping
   redevient une passe séparée : c'est un coût en plus, à comparer au gain de l'upscaling.
 - **Changer `r.ArmASR.MobileUpscale` à chaud** est possible mais peut déclencher des compilations de PSO :

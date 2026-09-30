@@ -331,6 +331,7 @@ struct FArmASRFrameSettings
 	bool bIsUltraPerformance = false;
 	bool bRequestedAutoExposure = false;
 	bool bAllowReactiveMask = false;
+	bool bLDRInput = false; // Mobile LDR: gamma-space scene colour, no eye adaptation.
 	float Sharpness = 0.0f;
 	EPixelFormat MaskFormat = PF_R8;
 	int32 FrameIndex = 0;
@@ -340,7 +341,7 @@ struct FArmASRFrameSettings
 	FIntPoint InputExtentsQuantized = FIntPoint::ZeroValue;
 	FScreenPassTextureViewport InputViewport;
 	FScreenPassTextureViewport OutputViewport;
-	FRDGTextureRef EngineExposureTexture = nullptr; // Engine exposure, shared by both eyes. Null when auto exposure is used.
+	FRDGTextureRef EngineExposureTexture = nullptr; // Engine exposure (1.0 in Mobile LDR), shared by both eyes. Null when auto exposure is used.
 };
 
 // Inputs and outputs of one eye.
@@ -628,6 +629,7 @@ static float AddArmASREyePasses(
 		// Create shader and add pass.
 		FArmASRReconstructPrevDepthPS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FArmASR_ApplyUltraPerfOpt>(bIsUltraPerformance);
+		PermutationVector.Set<FArmASR_LDRInput>(Frame.bLDRInput);
 		TShaderMapRef<FArmASRReconstructPrevDepthPS> RpdShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
 			GraphBuilder, PrimaryView.ShaderMap,
@@ -740,6 +742,7 @@ static float AddArmASREyePasses(
 		PermutationVector.Set<FArmASR_ApplyBalancedOpt>(bIsBalancedOrPerformance ? 1 : 0);
 		PermutationVector.Set<FArmASR_ApplyPerfOpt>(bIsPerformance ? 1 : 0);
 		PermutationVector.Set<FArmASR_ApplyUltraPerfOpt>(bIsUltraPerformance ? 1 : 0);
+		PermutationVector.Set<FArmASR_LDRInput>(Frame.bLDRInput);
 
 		TShaderMapRef<FArmASRAccumulatePS> AccumulateShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
@@ -886,6 +889,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	const int32 NumEyes = (SecondEyeView && SceneColor->Desc.ArraySize >= ArmASRMaxEyes) ? ArmASRMaxEyes : 1;
 	const bool bIsStereo = bMultiView || IStereoRendering::IsStereoEyeView(View);
 	Frame.bAllowReactiveMask = !bIsStereo;
+	Frame.bLDRInput = (View.GetFeatureLevel() <= ERHIFeatureLevel::ES3_1) && !IsMobileHDR();
 
 	// Create the output texture and assign it to Outputs. This will be updated in the Accumulate or RCAS shader.
 	// Copying the scene colour description keeps the array layout for multiview.
@@ -914,7 +918,12 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	Frame.PrevPreExposure = ValidHistory ? PrevHistory->PreExposure : 0.0f;
 
 	// Engine exposure is the same for both eyes, copy it once.
-	if (!Frame.bRequestedAutoExposure || Frame.bIsUltraPerformance)
+	// Mobile LDR has no eye adaptation and its scene colour is already exposed: use a constant 1.0.
+	if (Frame.bLDRInput && (!Frame.bRequestedAutoExposure || Frame.bIsUltraPerformance))
+	{
+		Frame.EngineExposureTexture = GSystemTextures.GetWhiteDummy(GraphBuilder);
+	}
+	else if (!Frame.bRequestedAutoExposure || Frame.bIsUltraPerformance)
 	{
 		FArmASRCopyExposureCS::FParameters* CopyExposureParameters = GraphBuilder.AllocParameters<FArmASRCopyExposureCS::FParameters>();
 		SetCopyExposureParameters(CopyExposureParameters, View, GraphBuilder);

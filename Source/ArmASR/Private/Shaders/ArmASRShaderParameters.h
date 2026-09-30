@@ -28,6 +28,8 @@
 class FArmASR_ApplyBalancedOpt : SHADER_PERMUTATION_BOOL("FFXM_FSR2_OPTION_SHADER_OPT_BALANCED");
 class FArmASR_ApplyPerfOpt : SHADER_PERMUTATION_BOOL("FFXM_FSR2_OPTION_SHADER_OPT_PERFORMANCE");
 class FArmASR_ApplyUltraPerfOpt : SHADER_PERMUTATION_BOOL("FFXM_FSR2_OPTION_SHADER_OPT_ULTRA_PERFORMANCE");
+// Scene colour is LDR (Mobile LDR), so the HDR tonemapping around accumulation is skipped.
+class FArmASR_LDRInput : SHADER_PERMUTATION_BOOL("ARMASR_LDR_INPUT");
 
 class FArmASRGlobalShader : public FGlobalShader
 {
