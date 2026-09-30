@@ -27,7 +27,7 @@ import stat
 import sys
 
 PATCH_ID = "ARMASR_VR_PATCH"
-PATCH_VERSION = 1
+PATCH_VERSION = 2
 DEFAULT_ENGINE = r"J:\_AtlasXRInc\Unreality"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -120,15 +120,35 @@ PATCHES = [
     },
     {
         "file": "Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp",
-        "why": "Render into the (reduced resolution) scene colour instead of the back buffer when upscaling in Mobile LDR.",
+        "why": "Render into the (reduced resolution) scene colour instead of the back buffer when upscaling in Mobile LDR, "
+               "and skip the scene velocity pass when Arm ASR reads the AppSpaceWarp motion vectors instead.",
         "edits": [
             ("before",
              "void FMobileSceneRenderer::InitViews(",
-             helper("MobileShadingRenderer")),
+             helper("MobileShadingRenderer")
+             + "// BEGIN ARMASR_VR_PATCH - with the SpaceWarp velocity shaders, the scene velocity holds raw signed values in a UNORM\n"
+               "// target that Arm ASR cannot use: it reads the AppSpaceWarp motion vectors (or depth) instead, so the pass is wasted.\n"
+               "static bool ArmASRVR_SkipSceneVelocity(const FSceneViewFamily& ViewFamily, EShaderPlatform ShaderPlatform)\n"
+               "{\n"
+               "\tstatic const TConsoleVariableData<int32>* CVarVelocitySource = nullptr;\n"
+               "\tif (!CVarVelocitySource)\n"
+               "\t{\n"
+               "\t\tCVarVelocitySource = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT(\"r.ArmASR.VelocitySource\"));\n"
+               "\t}\n"
+               "\treturn ArmASRVR_IsMobileUpscaleEnabled_MobileShadingRenderer()\n"
+               "\t\t&& ViewFamily.GetTemporalUpscalerInterface() != nullptr\n"
+               "\t\t&& SupportsSpaceWarp(ShaderPlatform)\n"
+               "\t\t&& CVarVelocitySource && CVarVelocitySource->GetValueOnAnyThread() != 1;\n"
+               "}\n"
+               "// END ARMASR_VR_PATCH\n"
+               "\n"),
             ("replace",
              "bRenderToSceneColor = !bGammaSpace",
              "bRenderToSceneColor = !bGammaSpace\n"
              "\t\t\t\t\t\t|| (ViewFamily.GetTemporalUpscalerInterface() != nullptr && ArmASRVR_IsMobileUpscaleEnabled_MobileShadingRenderer()) /* ARMASR_VR_PATCH */"),
+            ("replace",
+             "\t\tif (bShouldRenderVelocities)\n\t\t{\n\t\t\t// Render the velocities of movable objects\n",
+             "\t\tif (bShouldRenderVelocities && !ArmASRVR_SkipSceneVelocity(ViewFamily, ShaderPlatform) /* ARMASR_VR_PATCH */)\n\t\t{\n\t\t\t// Render the velocities of movable objects\n"),
         ],
     },
     {

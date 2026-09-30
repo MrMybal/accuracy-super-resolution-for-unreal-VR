@@ -29,17 +29,29 @@
 
 class FArmASR_CopyInputs : SHADER_PERMUTATION_BOOL("ARMASR_COPY_INPUTS");
 
+// Motion source, see ConvertVelocity.usf: 0 UE scene velocity, 1 AppSpaceWarp motion vectors, 2 depth only.
+enum class EArmASRVelocitySource : int32
+{
+	SceneVelocity = 0,
+	SpaceWarp = 1,
+	DepthOnly = 2,
+	MAX
+};
+class FArmASR_VelocitySource : SHADER_PERMUTATION_ENUM_CLASS("ARMASR_VELOCITY_SOURCE", EArmASRVelocitySource);
+
 class FArmASRConvertVelocity : public FGlobalShader
 {
 public:
 	DECLARE_GLOBAL_SHADER(FArmASRConvertVelocity);
 	SHADER_USE_PARAMETER_STRUCT(FArmASRConvertVelocity, FGlobalShader);
 
-	using FPermutationDomain = TShaderPermutationDomain<FArmASR_CopyInputs>;
+	using FPermutationDomain = TShaderPermutationDomain<FArmASR_CopyInputs, FArmASR_VelocitySource>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputDepth)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputVelocity)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputMotionVector)
+		SHADER_PARAMETER_SAMPLER(SamplerState, InputMotionVectorSampler)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputColor)
 		SHADER_PARAMETER(FIntPoint, InputOffset)
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
@@ -48,6 +60,12 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
+		// AppSpaceWarp motion vectors only exist on Vulkan mobile with vr.SupportMobileSpaceWarp.
+		const FPermutationDomain PermutationVector(Parameters.PermutationId);
+		if (PermutationVector.Get<FArmASR_VelocitySource>() != EArmASRVelocitySource::SceneVelocity && !IsMobilePlatform(Parameters.Platform))
+		{
+			return false;
+		}
 		return FArmASRGlobalShader::ShouldCompilePermutation(Parameters);
 	}
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)

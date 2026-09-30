@@ -48,8 +48,24 @@ float3 ComputeStaticVelocity(float2 ScreenPos, float DeviceZ)
 #define ARMASR_COPY_INPUTS 0
 #endif
 
+// Where object/camera motion comes from:
+//  0: UE scene velocity (encoded, written by the velocity pass).
+//  1: AppSpaceWarp motion vectors (Meta fork): raw float3 NDC motion of all geometry, rendered at the
+//     OpenXR recommended motion vector size, so sampled with a UV rather than a pixel position.
+//  2: Depth only: camera motion reconstructed from depth. Used when the project compiles the SpaceWarp
+//     velocity shaders (SUPPORT_VR_FRAME_EXTRAPOLATION) but SpaceWarp is not running this frame: the
+//     velocity pass then writes raw signed values into the UNORM scene velocity, which is unusable.
+#ifndef ARMASR_VELOCITY_SOURCE
+#define ARMASR_VELOCITY_SOURCE 0
+#endif
+
 Texture2D InputDepth;
+#if ARMASR_VELOCITY_SOURCE == 0
 Texture2D InputVelocity;
+#elif ARMASR_VELOCITY_SOURCE == 1
+Texture2D InputMotionVector;
+SamplerState InputMotionVectorSampler;
+#endif
 #if ARMASR_COPY_INPUTS
 Texture2D InputColor;
 #endif
@@ -71,18 +87,31 @@ void main(
     int2 InputPos = int2(Pos) + InputOffset;
     float Depth = InputDepth[InputPos].x;
 
+    // This doesn't need the viewport origin as it is a UV, not a pixel coordinate (i.e. it is relative to the origin not (0,0))
+    float2 ViewportUV = (Pos + 0.5) * View.ViewSizeAndInvSize.zw;
+
     float2 Velocity = 0;
+    bool bHasVelocity = false;
+#if ARMASR_VELOCITY_SOURCE == 0
     float4 EncodedVelocity = InputVelocity[InputPos];
     if (EncodedVelocity.x > 0.0)
     {
         Velocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
+        bHasVelocity = true;
     }
-    else
+#elif ARMASR_VELOCITY_SOURCE == 1
+    // The motion vector texture covers the whole eye view. Cleared to 0 where no geometry was drawn (sky).
+    float3 MotionVector = InputMotionVector.SampleLevel(InputMotionVectorSampler, ViewportUV, 0).xyz;
+    if (any(MotionVector != 0.0))
     {
-        // This doesn't need the viewport origin as it is a UV, not a pixel coordinate (i.e. it is relative to the origin not (0,0))
-        float2 ViewportUV = (Pos + 0.5) * View.ViewSizeAndInvSize.zw;
-        float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+        Velocity = MotionVector.xy;
+        bHasVelocity = true;
+    }
+#endif
 
+    if (!bHasVelocity)
+    {
+        float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
         Velocity = ComputeStaticVelocity(ScreenPos, Depth).xy;
     }
 

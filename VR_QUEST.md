@@ -19,6 +19,35 @@ avec Arm ASR (upscaling temporel). L'anti-aliasing temporel de l'upscaler rempla
 - **Mode LDR détecté automatiquement** (mobile + `r.MobileHDR=False`) : exposition fixée à 1.0 (pas d'eye adaptation en LDR)
   et variantes de shaders sans tonemapping HDR autour de l'accumulation (Accumulate, Reconstruct Previous Depth) : moins d'ALU.
 
+## Motion vectors et AppSpaceWarp
+
+Dans le fork Meta, quand le projet active `vr.SupportMobileSpaceWarp`, **tous** les shaders de vélocité sont compilés avec
+`SUPPORT_VR_FRAME_EXTRAPOLATION` et écrivent une vélocité 3D brute (valeurs signées, non encodées). La vélocité de scène UE
+(`SceneVelocity`, format UNORM) devient alors inutilisable : les valeurs négatives sont écrasées à 0. Le TAA d'Epic est affecté
+de la même façon.
+
+Quand l'AppSpaceWarp tourne (`bRenderStereoVelocity`), le moteur rend dans la swapchain OpenXR de motion vectors
+(`PF_FloatRGBA`, texture array en multiview, taille recommandée par le runtime, plus petite que l'œil) le mouvement de **toute**
+la géométrie (statique comprise). C'est exactement ce dont l'upscaler a besoin.
+
+`r.ArmASR.VelocitySource` :
+
+| Valeur | Comportement |
+|---|---|
+| 0 (défaut) | Auto : motion vectors ASW s'ils sont rendus cette frame (multiview) ; sinon, si le projet compile le SpaceWarp, mouvement caméra reconstruit depuis la profondeur (les objets mobiles peuvent laisser une traînée) ; sinon vélocité de scène UE |
+| 1 | Vélocité de scène UE (à éviter avec `vr.SupportMobileSpaceWarp`) |
+| 2 | ASW si disponible, sinon comme Auto |
+| 3 | Profondeur seule (debug) |
+
+Les motion vectors ASW sont échantillonnés en UV (résolution différente), et là où rien n'est dessiné (ciel) le mouvement caméra est
+reconstruit depuis la profondeur. Après lecture, la swapchain est remise dans l'état render target pour le runtime OpenXR.
+
+Le patch moteur v2 **saute en plus la passe de vélocité UE** quand le projet compile le SpaceWarp et que l'upscaler
+n'utilise pas la vélocité de scène (`r.ArmASR.VelocitySource` différent de 1) : c'est une passe de géométrie complète de gagnée par frame.
+Note : le SSR mobile, s'il était utilisé, lit aussi cette vélocité.
+
+Pour en profiter : `vr.SupportMobileSpaceWarp=True` et `r.Mobile.Oculus.SpaceWarp.Enable=1`.
+
 ## Pourquoi un patch moteur
 
 Dans le fork Meta, le renderer mobile forward **ne lance jamais la chaîne de post-process** :
@@ -33,7 +62,7 @@ Or l'upscaler temporel est appelé depuis la chaîne de post-process. Le patch (
 | `Engine/Private/SceneView.cpp` | Autorise le screen percentage en Mobile LDR |
 | `Engine/Private/GameViewportClient.cpp` | Applique `r.ScreenPercentage` au viewport de jeu en Mobile LDR |
 | `Renderer/Private/SceneRendering.cpp` | Garde le TAA (jitter, vélocité, upscaler) sans post-process quand un upscaler est présent |
-| `Renderer/Private/MobileShadingRenderer.cpp` | Rend dans la scene color (basse résolution) au lieu du backbuffer en LDR |
+| `Renderer/Private/MobileShadingRenderer.cpp` | Rend dans la scene color (basse résolution) au lieu du backbuffer en LDR ; saute la passe de vélocité UE quand l'upscaler utilise les motion vectors ASW |
 | `Renderer/Private/PostProcess/PostProcessing.cpp` | Appelle l'upscaler quand le post-process mobile est désactivé (LDR) |
 
 **Tout est conditionné par `r.ArmASR.MobileUpscale`** : tant qu'elle vaut 0, le moteur patché se comporte
@@ -95,8 +124,8 @@ r.MobileHDR=False                 ; mode LDR
 
 - **Validé** : le code C++ du plugin compile contre Unreality (Win64). Les shaders sont compilés au lancement :
   surveiller le log au premier démarrage.
-- **Vélocité / SpaceWarp** : le plugin utilise la vélocité de scène UE. Le buffer de motion vectors de l'AppSpaceWarp
-  n'est pas utilisé (autre format, autre résolution).
+- **Vélocité / SpaceWarp** : voir la section dédiée. À tester : ASW actif (motion vectors ASW), et ASW compilé mais désactivé
+  à chaud (mouvement caméra seul, risque de traînée sur les objets mobiles).
 - **Foveated rendering (FDM)** : non pris en compte par l'upscaler. La densité variable réduit la qualité en périphérie
   mais ne casse pas les coordonnées.
 - **Exposition en LDR** : fixée à 1.0 par le plugin. `r.ArmASR.AutoExposure 1` reste possible pour comparer.

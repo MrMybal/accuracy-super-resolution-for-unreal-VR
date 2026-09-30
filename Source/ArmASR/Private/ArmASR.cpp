@@ -59,6 +59,18 @@ TAutoConsoleVariable<int32> CVarArmASRMobileUpscale(
 	TEXT("1: disable the tonemap subpass so the post-process chain runs the upscaler (Mobile HDR), and allow rendering at r.ScreenPercentage then upscaling with Arm ASR without post-processing (Mobile LDR)."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<int32> CVarArmASRVelocitySource(
+	TEXT("r.ArmASR.VelocitySource"),
+	0,
+	TEXT("Motion vectors used by Arm ASR.\n")
+	TEXT(" 0: Auto (default). AppSpaceWarp motion vectors when SpaceWarp renders them this frame (mobile multiview), otherwise the scene velocity.\n")
+	TEXT("    If the project compiles the SpaceWarp velocity shaders (vr.SupportMobileSpaceWarp) but SpaceWarp is not running, the scene velocity\n")
+	TEXT("    holds unusable raw values, so camera motion is reconstructed from depth instead.\n")
+	TEXT(" 1: Scene velocity.\n")
+	TEXT(" 2: AppSpaceWarp motion vectors when available, otherwise Auto.\n")
+	TEXT(" 3: Depth only (camera motion, moving objects will ghost). For debugging."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<int32> CVarArmASRCreateReactiveMask(
 	TEXT("r.ArmASR.CreateReactiveMask"),
 	1,
@@ -332,6 +344,7 @@ struct FArmASRFrameSettings
 	bool bRequestedAutoExposure = false;
 	bool bAllowReactiveMask = false;
 	bool bLDRInput = false; // Mobile LDR: gamma-space scene colour, no eye adaptation.
+	EArmASRVelocitySource VelocitySource = EArmASRVelocitySource::SceneVelocity;
 	float Sharpness = 0.0f;
 	EPixelFormat MaskFormat = PF_R8;
 	int32 FrameIndex = 0;
@@ -354,6 +367,7 @@ struct FArmASREyeContext
 	FRDGTextureRef SceneColor = nullptr;
 	FRDGTextureRef SceneDepth = nullptr;
 	FRDGTextureRef SceneVelocity = nullptr;
+	FRDGTextureRef SpaceWarpMotionVector = nullptr; // AppSpaceWarp motion vectors (texture array in multiview), when used.
 
 	// Array slice holding this eye, INDEX_NONE for plain 2D textures.
 	int32 ArraySlice = INDEX_NONE;
@@ -528,6 +542,11 @@ static float AddArmASREyePasses(
 
 		ConvertVelocityParameters->InputDepth = DepthTexture;
 		ConvertVelocityParameters->InputVelocity = VelocitySRV;
+		if (Frame.VelocitySource == EArmASRVelocitySource::SpaceWarp)
+		{
+			ConvertVelocityParameters->InputMotionVector = CreateEyeSRV(GraphBuilder, Eye.SpaceWarpMotionVector, Eye.ArraySlice);
+			ConvertVelocityParameters->InputMotionVectorSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		}
 		ConvertVelocityParameters->InputOffset = Eye.InputOffset;
 		ConvertVelocityParameters->View = EyeView.ViewUniformBuffer;
 		ConvertVelocityParameters->RenderTargets[0] = FRenderTargetBinding(MotionVectorTextureNew, ERenderTargetLoadAction::ENoAction);
@@ -551,6 +570,7 @@ static float AddArmASREyePasses(
 
 		FArmASRConvertVelocity::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FArmASR_CopyInputs>(bCopyInputs);
+		PermutationVector.Set<FArmASR_VelocitySource>(Frame.VelocitySource);
 		TShaderMapRef<FArmASRConvertVelocity> ConvertVelocityShader(PrimaryView.ShaderMap, PermutationVector);
 		FPixelShaderUtils::AddFullscreenPass(
 			GraphBuilder, PrimaryView.ShaderMap,
@@ -891,6 +911,40 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 	Frame.bAllowReactiveMask = !bIsStereo;
 	Frame.bLDRInput = (View.GetFeatureLevel() <= ERHIFeatureLevel::ES3_1) && !IsMobileHDR();
 
+	// Motion source. With AppSpaceWarp (Meta fork) the velocity pass also draws static geometry and writes raw
+	// NDC motion into the OpenXR motion vector swapchain. Built with SpaceWarp support, the same shaders write raw
+	// signed values into the UNORM scene velocity, which therefore cannot be decoded.
+	FRDGTextureRef SpaceWarpMotionVector = nullptr;
+	{
+		const bool bSpaceWarpShaders = SupportsSpaceWarp(View.GetShaderPlatform());
+		const FSceneTextures& SceneTextures = ViewInfo.GetSceneTextures();
+		const bool bSpaceWarpRendered = bMultiView
+			&& View.Family->bRenderStereoVelocity
+			&& SceneTextures.MotionVector != nullptr
+			&& SceneTextures.MotionVectorDepth != nullptr
+			&& SceneTextures.MotionVector->Desc.Dimension == ETextureDimension::Texture2DArray
+			&& SceneTextures.MotionVector->Desc.ArraySize >= NumEyes;
+
+		const int32 RequestedSource = CVarArmASRVelocitySource.GetValueOnRenderThread();
+		if (RequestedSource == 1)
+		{
+			Frame.VelocitySource = EArmASRVelocitySource::SceneVelocity;
+		}
+		else if (RequestedSource == 3)
+		{
+			Frame.VelocitySource = EArmASRVelocitySource::DepthOnly;
+		}
+		else if (bSpaceWarpRendered)
+		{
+			Frame.VelocitySource = EArmASRVelocitySource::SpaceWarp;
+			SpaceWarpMotionVector = SceneTextures.MotionVector;
+		}
+		else
+		{
+			Frame.VelocitySource = bSpaceWarpShaders ? EArmASRVelocitySource::DepthOnly : EArmASRVelocitySource::SceneVelocity;
+		}
+	}
+
 	// Create the output texture and assign it to Outputs. This will be updated in the Accumulate or RCAS shader.
 	// Copying the scene colour description keeps the array layout for multiview.
 	FRDGTextureDesc OutputColorDesc = SceneColor->Desc;
@@ -953,6 +1007,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		Eye.SceneColor = SceneColor;
 		Eye.SceneDepth = SceneDepth;
 		Eye.SceneVelocity = VelocityTexture;
+		Eye.SpaceWarpMotionVector = SpaceWarpMotionVector;
 		Eye.ArraySlice = bMultiView ? EyeIndex : INDEX_NONE;
 		Eye.InputOffset = bMultiView ? FIntPoint::ZeroValue : Inputs.SceneColor.ViewRect.Min;
 		Eye.Output = Outputs.FullRes.Texture;
@@ -960,6 +1015,13 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		Eye.NewHistory = &NewHistory->Eyes[EyeIndex];
 
 		NewHistory->PreExposure = AddArmASREyePasses(GraphBuilder, ViewInfo, ArmASRInfo, Frame, Eye);
+	}
+
+	if (SpaceWarpMotionVector)
+	{
+		// The OpenXR runtime reads this swapchain image after the frame: give it back in the render target
+		// state it was left in by the motion vector pass, rather than the shader read state of our passes.
+		GraphBuilder.SetTextureAccessFinal(SpaceWarpMotionVector, ERHIAccess::RTV);
 	}
 
 	Outputs.NewHistory = NewHistory;
