@@ -1028,6 +1028,32 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 		NewHistory->PreExposure = AddArmASREyePasses(GraphBuilder, ViewInfo, ArmASRInfo, Frame, Eye);
 	}
 
+	// Log the active configuration whenever it changes. The velocity source can change every frame (SpaceWarp
+	// toggled, moving objects entering or leaving the view), so its changes are only logged at Verbose level.
+	{
+		static FString LastConfig;
+		static FString LastVelocityConfig;
+		const FString Config = FString::Printf(TEXT("%dx%d -> %dx%d, %d eye(s) (%s), quality %d, %s"),
+			Frame.InputExtents.X, Frame.InputExtents.Y, Frame.OutputExtents.X, Frame.OutputExtents.Y, NumEyes,
+			bMultiView ? TEXT("multiview") : (bIsStereo ? TEXT("side-by-side") : TEXT("mono")),
+			int32(Frame.QualityPreset), Frame.bLDRInput ? TEXT("LDR") : TEXT("HDR"));
+		const FString VelocityConfig = FString::Printf(TEXT("velocity source %d (scene velocity %s %dx%d, SpaceWarp shaders %d, SpaceWarp this frame %d)"),
+			int32(Frame.VelocitySource),
+			GPixelFormats[VelocityTexture->Desc.Format].Name, VelocityTexture->Desc.Extent.X, VelocityTexture->Desc.Extent.Y,
+			SupportsSpaceWarp(View.GetShaderPlatform()) ? 1 : 0, View.Family->bRenderStereoVelocity ? 1 : 0);
+		if (Config != LastConfig)
+		{
+			LastConfig = Config;
+			LastVelocityConfig = VelocityConfig;
+			UE_LOG(LogArmASR, Log, TEXT("Arm ASR active: %s, %s"), *Config, *VelocityConfig);
+		}
+		else if (VelocityConfig != LastVelocityConfig)
+		{
+			LastVelocityConfig = VelocityConfig;
+			UE_LOG(LogArmASR, Verbose, TEXT("Arm ASR %s"), *VelocityConfig);
+		}
+	}
+
 	if (SpaceWarpMotionVector)
 	{
 		// The OpenXR runtime reads this swapchain image after the frame: give it back in the render target
@@ -1117,6 +1143,19 @@ public:
 			ViewFamily.SetTemporalUpscalerInterface(new FArmASRTemporalUpscaler(ArmASRInfo, Denoiser));
 			InitFArmASRDenoiser(Denoiser);
 			return;
+		}
+
+		// Diagnostics for the main game view only, logged once per distinct reason.
+		if (ViewFamily.bIsMainViewFamily)
+		{
+			static int32 LastLoggedReason = -1;
+			const int32 Reason = int32(View->AntiAliasingMethod) * 16 + int32(View->PrimaryScreenPercentageMethod);
+			if (Reason != LastLoggedReason)
+			{
+				LastLoggedReason = Reason;
+				UE_LOG(LogArmASR, Log, TEXT("Arm ASR not used for this view family: screen percentage method %d (needs TemporalUpscale), anti-aliasing method %d (needs temporal AA, r.AntiAliasingMethod=2 / r.Mobile.AntiAliasing=2), post-processing show flag %d."),
+					int32(View->PrimaryScreenPercentageMethod), int32(View->AntiAliasingMethod), ViewFamily.EngineShowFlags.PostProcessing ? 1 : 0);
+			}
 		}
 	}
 

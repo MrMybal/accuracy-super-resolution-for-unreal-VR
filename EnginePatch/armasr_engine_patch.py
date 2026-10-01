@@ -27,7 +27,7 @@ import stat
 import sys
 
 PATCH_ID = "ARMASR_VR_PATCH"
-PATCH_VERSION = 3
+PATCH_VERSION = 4
 DEFAULT_ENGINE = r"J:\_AtlasXRInc\Unreality"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -63,7 +63,8 @@ def helper(suffix):
 PATCHES = [
     {
         "file": "Engine/Source/Runtime/Engine/Private/SceneUtils.cpp",
-        "why": "Disable the Meta tonemap subpass so the regular mobile post-process chain (which runs the temporal upscaler) is used, in HDR and LDR.",
+        "why": "Disable the Meta tonemap subpass so the regular mobile post-process chain (which runs the temporal upscaler) is used, in HDR and LDR, "
+               "and keep temporal AA in Mobile LDR (the engine forces it off there).",
         "edits": [
             ("before",
              "// BEGIN META SECTION 5.5 intead of checking bMultiViewRendering",
@@ -76,6 +77,11 @@ PATCHES = [
              "\t\treturn false;\n"
              "\t}\n"
              "\t// END ARMASR_VR_PATCH\n"),
+            ("replace",
+             "\t\tif (!IsMobileHDR() && AntiAliasingMethod != EAntiAliasingMethod::AAM_MSAA)\n",
+             "\t\t// ARMASR_VR_PATCH: keep temporal AA in Mobile LDR when Arm ASR upscales (it handles the jitter).\n"
+             "\t\tif (!IsMobileHDR() && AntiAliasingMethod != EAntiAliasingMethod::AAM_MSAA\n"
+             "\t\t\t&& !(AntiAliasingMethod == EAntiAliasingMethod::AAM_TemporalAA && ArmASRVR_IsMobileUpscaleEnabled_SceneUtils()))\n"),
         ],
     },
     {

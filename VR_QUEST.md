@@ -67,7 +67,7 @@ Or l'upscaler temporel est appelé depuis la chaîne de post-process. Le patch (
 
 | Fichier | Rôle |
 |---|---|
-| `Engine/Private/SceneUtils.cpp` | Désactive le tonemap subpass → la chaîne de post-process normale tourne (HDR) |
+| `Engine/Private/SceneUtils.cpp` | Désactive le tonemap subpass → la chaîne de post-process normale tourne (HDR) ; garde le TAA en Mobile LDR (le moteur le coupe en LDR) |
 | `Engine/Private/SceneView.cpp` | Autorise le screen percentage en Mobile LDR |
 | `Engine/Private/GameViewportClient.cpp` | Applique `r.ScreenPercentage` au viewport de jeu en Mobile LDR |
 | `Renderer/Private/SceneRendering.cpp` | Garde le TAA (jitter, vélocité, upscaler) sans post-process quand un upscaler est présent |
@@ -77,6 +77,16 @@ Or l'upscaler temporel est appelé depuis la chaîne de post-process. Le patch (
 
 **Tout est conditionné par `r.ArmASR.MobileUpscale`** : tant qu'elle vaut 0, le moteur patché se comporte
 exactement comme l'original.
+
+### Branche moteur `ARM_ASR_Integration` (Unreality)
+
+Le patch (v4) est appliqué et commité sur la branche `ARM_ASR_Integration` d'Unreality (créée depuis `oculus-5.5`,
+commits `Arm ASR VR integration ...`), sans aucune autre modification. L'éditeur Win64 y est compilé.
+
+- Tester l'intégration : rester sur `ARM_ASR_Integration` (l'éditeur y est compilé).
+- Revenir au moteur d'origine : `git checkout oculus-5.5` dans Unreality, puis recompiler (seuls les modules Engine et
+  Renderer changent).
+- La branche est locale (non poussée).
 
 ### Appliquer / retirer le patch
 
@@ -119,8 +129,10 @@ r.MobileHDR=False                 ; mode LDR
 
 ## Protocole de test
 
-1. **Éditeur, preview mobile Vulkan + VR preview** : vérifier que `ShowFlag.VisualizeTemporalUpscaler 1`
-   indique "Arm ASR" et les résolutions d'entrée/sortie attendues.
+1. **Éditeur, preview mobile Vulkan + VR preview** : le log `LogArmASR` indique la configuration active
+   (`Arm ASR active: <entrée> -> <sortie>, yeux, qualité, LDR/HDR, source de vélocité`) ou, si le plugin ne s'installe pas,
+   la raison (`Arm ASR not used ...` : méthode d'AA, screen percentage). `log LogArmASR Verbose` affiche aussi chaque
+   bascule de source de vélocité (SpaceWarp, objets mobiles).
 2. **Quest, LDR multiview** (config cible) : image nette dans les deux yeux, pas d'œil noir/dupliqué,
    pas de ghosting excessif en tournant la tête.
 3. **Quest, HDR multiview**.
@@ -137,7 +149,11 @@ r.MobileHDR=False                 ; mode LDR
   Vulkan, et le jeu desktop DX12.
 - **Corrigé au passage (bug du plugin d'origine)** : l'éditeur crashait au démarrage en preview mobile D3D (DX11/DX12),
   le parseur HLSL d'UE ne connaissant pas `min16int`/`min16uint`. Le FP16 est désactivé pour ce format de preview.
-- **Non validé** : le code C++ du patch moteur n'a pas été compilé (il faudrait une copie du moteur).
+- **Validé (moteur)** : le patch v4 compile (éditeur Win64, branche `ARM_ASR_Integration`). Test de fumée en preview mobile
+  ES3.1 (Vulkan et DX12), Mobile LDR, `r.ScreenPercentage=70` : l'upscaler s'installe et tourne sans erreur
+  (2868x2868 -> 4096x4096). Avec des objets en mouvement (`Tools/make_velocity_test_map.py`) : vélocité UE encodée en DX12,
+  vélocité brute `G16R16F` lue en Vulkan avec les shaders SpaceWarp.
+- **Non validé** : compilation Android du code moteur patché (elle se fera au packaging), et tout ce qui demande le casque.
 - **Vélocité / SpaceWarp** : voir la section dédiée. À tester : ASW actif, ASW désactivé à chaud, et plusieurs bascules
   successives (`r.Mobile.Oculus.SpaceWarp.Enable 0/1`) en regardant des objets mobiles.
 - **Foveated rendering (FDM)** : non pris en compte par l'upscaler. La densité variable réduit la qualité en périphérie
