@@ -34,19 +34,28 @@ la géométrie (statique comprise). C'est exactement ce dont l'upscaler a besoin
 
 | Valeur | Comportement |
 |---|---|
-| 0 (défaut) | Auto : motion vectors ASW s'ils sont rendus cette frame (multiview) ; sinon, si le projet compile le SpaceWarp, mouvement caméra reconstruit depuis la profondeur (les objets mobiles peuvent laisser une traînée) ; sinon vélocité de scène UE |
-| 1 | Vélocité de scène UE (à éviter avec `vr.SupportMobileSpaceWarp`) |
+| 0 (défaut) | Auto, **réévalué à chaque frame** : on peut activer/désactiver le SpaceWarp à chaud |
+| 1 | Vélocité de scène UE (le patch ne saute alors jamais la passe de vélocité) |
 | 2 | ASW si disponible, sinon comme Auto |
 | 3 | Profondeur seule (debug) |
+
+Bascule en mode Auto, frame par frame :
+
+| Situation de la frame | Source utilisée |
+|---|---|
+| SpaceWarp actif (motion vectors rendus, multiview) | motion vectors ASW ; le patch saute la passe de vélocité UE |
+| SpaceWarp compilé mais inactif, moteur patché | vélocité UE brute : le patch passe la cible en float (`PF_G16R16F`), les objets mobiles gardent leur mouvement |
+| SpaceWarp compilé mais inactif, moteur non patché | mouvement caméra seul, reconstruit depuis la profondeur (traînée possible sur les objets mobiles) |
+| Pas de SpaceWarp dans le projet | vélocité UE normale |
 
 Les motion vectors ASW sont échantillonnés en UV (résolution différente), et là où rien n'est dessiné (ciel) le mouvement caméra est
 reconstruit depuis la profondeur. Après lecture, la swapchain est remise dans l'état render target pour le runtime OpenXR.
 
-Le patch moteur v2 **saute en plus la passe de vélocité UE** quand le projet compile le SpaceWarp et que l'upscaler
-n'utilise pas la vélocité de scène (`r.ArmASR.VelocitySource` différent de 1) : c'est une passe de géométrie complète de gagnée par frame.
-Note : le SSR mobile, s'il était utilisé, lit aussi cette vélocité.
+Notes :
+- Le SSR mobile, s'il était utilisé, lit aussi la vélocité UE (absente les frames où le SpaceWarp tourne).
+- La première bascule peut provoquer une compilation de PSO (format de vélocité différent de celui pré-caché).
 
-Pour en profiter : `vr.SupportMobileSpaceWarp=True` et `r.Mobile.Oculus.SpaceWarp.Enable=1`.
+Pour utiliser le SpaceWarp : `vr.SupportMobileSpaceWarp=True`, puis `r.Mobile.Oculus.SpaceWarp.Enable=1/0` pour l'activer ou le désactiver.
 
 ## Pourquoi un patch moteur
 
@@ -54,7 +63,7 @@ Dans le fork Meta, le renderer mobile forward **ne lance jamais la chaîne de po
 - en **HDR**, le tonemapping est fait dans un *subpass* (`IsMobileTonemapSubpassEnabled` renvoie vrai dès que Mobile HDR est actif) ;
 - en **LDR**, il n'y a pas de post-process du tout, on rend directement dans le backbuffer, et le screen percentage est interdit.
 
-Or l'upscaler temporel est appelé depuis la chaîne de post-process. Le patch (6 fichiers, ~100 lignes) :
+Or l'upscaler temporel est appelé depuis la chaîne de post-process. Le patch (7 fichiers, ~150 lignes) :
 
 | Fichier | Rôle |
 |---|---|
@@ -62,7 +71,8 @@ Or l'upscaler temporel est appelé depuis la chaîne de post-process. Le patch (
 | `Engine/Private/SceneView.cpp` | Autorise le screen percentage en Mobile LDR |
 | `Engine/Private/GameViewportClient.cpp` | Applique `r.ScreenPercentage` au viewport de jeu en Mobile LDR |
 | `Renderer/Private/SceneRendering.cpp` | Garde le TAA (jitter, vélocité, upscaler) sans post-process quand un upscaler est présent |
-| `Renderer/Private/MobileShadingRenderer.cpp` | Rend dans la scene color (basse résolution) au lieu du backbuffer en LDR ; saute la passe de vélocité UE quand l'upscaler utilise les motion vectors ASW |
+| `Renderer/Private/MobileShadingRenderer.cpp` | Rend dans la scene color (basse résolution) au lieu du backbuffer en LDR ; saute la passe de vélocité UE les frames où l'upscaler utilise les motion vectors ASW |
+| `Renderer/Private/VelocityRendering.cpp` | Vélocité de scène en float quand les shaders SpaceWarp sont compilés (valeurs brutes signées lisibles quand le SpaceWarp est coupé) |
 | `Renderer/Private/PostProcess/PostProcessing.cpp` | Appelle l'upscaler quand le post-process mobile est désactivé (LDR) |
 
 **Tout est conditionné par `r.ArmASR.MobileUpscale`** : tant qu'elle vaut 0, le moteur patché se comporte
@@ -122,10 +132,14 @@ r.MobileHDR=False                 ; mode LDR
 
 ## Points à surveiller (non testés sur casque)
 
-- **Validé** : le code C++ du plugin compile contre Unreality (Win64). Les shaders sont compilés au lancement :
-  surveiller le log au premier démarrage.
-- **Vélocité / SpaceWarp** : voir la section dédiée. À tester : ASW actif (motion vectors ASW), et ASW compilé mais désactivé
-  à chaud (mouvement caméra seul, risque de traînée sur les objets mobiles).
+- **Validé** : le plugin compile pour Win64 et Android arm64. Les shaders compilent pour : Vulkan Android (cook, avec et
+  sans `vr.SupportMobileSpaceWarp`), Windows D3D12 SM6, D3D11 SM5, Vulkan SM5 (cook), preview mobile ES3.1 en DX11, DX12 et
+  Vulkan, et le jeu desktop DX12.
+- **Corrigé au passage (bug du plugin d'origine)** : l'éditeur crashait au démarrage en preview mobile D3D (DX11/DX12),
+  le parseur HLSL d'UE ne connaissant pas `min16int`/`min16uint`. Le FP16 est désactivé pour ce format de preview.
+- **Non validé** : le code C++ du patch moteur n'a pas été compilé (il faudrait une copie du moteur).
+- **Vélocité / SpaceWarp** : voir la section dédiée. À tester : ASW actif, ASW désactivé à chaud, et plusieurs bascules
+  successives (`r.Mobile.Oculus.SpaceWarp.Enable 0/1`) en regardant des objets mobiles.
 - **Foveated rendering (FDM)** : non pris en compte par l'upscaler. La densité variable réduit la qualité en périphérie
   mais ne casse pas les coordonnées.
 - **Exposition en LDR** : fixée à 1.0 par le plugin. `r.ArmASR.AutoExposure 1` reste possible pour comparer.

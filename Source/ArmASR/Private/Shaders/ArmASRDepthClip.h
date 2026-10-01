@@ -39,6 +39,10 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
+		if (!IsArmASRQualityPermutationUsed(FPermutationDomain(Parameters.PermutationId)))
+		{
+			return false;
+		}
 		return FArmASRGlobalShader::ShouldCompilePermutation(Parameters);
 	}
 

@@ -29,12 +29,14 @@
 
 class FArmASR_CopyInputs : SHADER_PERMUTATION_BOOL("ARMASR_COPY_INPUTS");
 
-// Motion source, see ConvertVelocity.usf: 0 UE scene velocity, 1 AppSpaceWarp motion vectors, 2 depth only.
+// Motion source, see ConvertVelocity.usf: 0 UE scene velocity, 1 AppSpaceWarp motion vectors, 2 depth only,
+// 3 raw (unencoded, float) scene velocity written by the SpaceWarp velocity shaders.
 enum class EArmASRVelocitySource : int32
 {
 	SceneVelocity = 0,
 	SpaceWarp = 1,
 	DepthOnly = 2,
+	SceneVelocityRaw = 3,
 	MAX
 };
 class FArmASR_VelocitySource : SHADER_PERMUTATION_ENUM_CLASS("ARMASR_VELOCITY_SOURCE", EArmASRVelocitySource);

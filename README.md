@@ -14,6 +14,7 @@ SPDX-License-Identifier: MIT -->
 - [Usage](#usage)
 - [Settings](#settings)
 - [Configuration Parameters](#configuration-parameters)
+- [VR / Meta Quest (fork)](#vr--meta-quest-fork)
 - [License](#license)
 - [Trademarks and Copyrights](#trademarks-and-copyrights)
 - [Contact](#contact)
@@ -171,6 +172,21 @@ The following plugin-specific console variables can be set:
 
 ### Screen Space Reflections
 When utilizing screen space reflections, it can be beneficial to incorporate them into the reactive mask. To do this, ensure that `r.SSR.ExperimentalDenoiser` is set to `1`.
+
+## VR / Meta Quest (fork)
+
+This fork (branch `vr-quest`) adds stereo support aimed at Meta Quest with the mobile forward renderer
+(Vulkan, multiview), on the Meta Unreal Engine fork (`oculus-5.5`):
+
+- Stereo view pairs, per-eye history; multiview texture arrays processed slice by slice; side-by-side stereo.
+- Mobile HDR and Mobile LDR. LDR is detected automatically (constant exposure, LDR shader permutations).
+- AppSpaceWarp aware: `r.ArmASR.VelocitySource` reads the SpaceWarp motion vectors when SpaceWarp runs and switches
+  back to the scene velocity when it is toggled off at runtime.
+- The Meta fork never runs the mobile post-process chain (tonemap subpass in HDR, no post-processing in LDR), so an
+  optional engine patch is provided in `EnginePatch/` (apply / revert with backups, gated by `r.ArmASR.MobileUpscale`).
+
+See [VR_QUEST.md](VR_QUEST.md) (French) for the setup, the engine patch and the test protocol, and
+[VR_PORT_PLAN.md](VR_PORT_PLAN.md) for the status.
 
 ## License
 

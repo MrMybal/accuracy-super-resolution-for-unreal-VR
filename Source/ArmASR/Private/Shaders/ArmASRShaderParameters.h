@@ -31,6 +31,26 @@ class FArmASR_ApplyUltraPerfOpt : SHADER_PERMUTATION_BOOL("FFXM_FSR2_OPTION_SHAD
 // Scene colour is LDR (Mobile LDR), so the HDR tonemapping around accumulation is skipped.
 class FArmASR_LDRInput : SHADER_PERMUTATION_BOOL("ARMASR_LDR_INPUT");
 
+// Quality preset permutations used at runtime: Quality (none), Balanced, Performance (Balanced + Perf) and
+// Ultra Performance (UltraPerf alone). Other combinations are never selected; they are not compiled, which also
+// avoids an HLSL parser crash on PCD3D_ES3_1 (mobile preview) with Perf + Sharpening without Balanced.
+template<typename TPermutationDomain>
+inline bool IsArmASRQualityPermutationUsed(const TPermutationDomain& PermutationVector)
+{
+	const bool bBalanced = PermutationVector.template Get<FArmASR_ApplyBalancedOpt>();
+	const bool bPerf = PermutationVector.template Get<FArmASR_ApplyPerfOpt>();
+	const bool bUltraPerf = PermutationVector.template Get<FArmASR_ApplyUltraPerfOpt>();
+	if (bPerf && !bBalanced)
+	{
+		return false;
+	}
+	if (bUltraPerf && (bBalanced || bPerf))
+	{
+		return false;
+	}
+	return true;
+}
+
 class FArmASRGlobalShader : public FGlobalShader
 {
 public:

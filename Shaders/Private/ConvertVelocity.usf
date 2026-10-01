@@ -55,12 +55,14 @@ float3 ComputeStaticVelocity(float2 ScreenPos, float DeviceZ)
 //  2: Depth only: camera motion reconstructed from depth. Used when the project compiles the SpaceWarp
 //     velocity shaders (SUPPORT_VR_FRAME_EXTRAPOLATION) but SpaceWarp is not running this frame: the
 //     velocity pass then writes raw signed values into the UNORM scene velocity, which is unusable.
+//  3: Raw scene velocity: same SpaceWarp velocity shaders, but the engine patch makes the scene velocity a
+//     float target, so the raw NDC motion of moving objects is kept and read as is.
 #ifndef ARMASR_VELOCITY_SOURCE
 #define ARMASR_VELOCITY_SOURCE 0
 #endif
 
 Texture2D InputDepth;
-#if ARMASR_VELOCITY_SOURCE == 0
+#if ARMASR_VELOCITY_SOURCE == 0 || ARMASR_VELOCITY_SOURCE == 3
 Texture2D InputVelocity;
 #elif ARMASR_VELOCITY_SOURCE == 1
 Texture2D InputMotionVector;
@@ -105,6 +107,14 @@ void main(
     if (any(MotionVector != 0.0))
     {
         Velocity = MotionVector.xy;
+        bHasVelocity = true;
+    }
+#elif ARMASR_VELOCITY_SOURCE == 3
+    // Cleared to 0, written only for moving objects when SpaceWarp is off.
+    float2 RawVelocity = InputVelocity[InputPos].xy;
+    if (any(RawVelocity != 0.0))
+    {
+        Velocity = RawVelocity;
         bHasVelocity = true;
     }
 #endif

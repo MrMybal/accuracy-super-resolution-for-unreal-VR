@@ -39,7 +39,10 @@ void FArmASRGlobalShader::ModifyCompilationEnvironment(const FGlobalShaderPermut
 	}
 
 	// Disable FP16 for OpenGL with HLSLCC or for DX11 or for mobile preview, as it is not always supported.
-	bool bDisableFp16 = (bIsOpenGL && bIsHlslcc) || bIsD3DFXC || bIsPreviewPlatform;
+	// PCD3D_ES3_1 (D3D11/D3D12 mobile preview) is not reported as simulated, but its compiler runs UE's HLSL parser,
+	// which does not know min16int / min16uint and asserts on the FP16 type definitions.
+	const bool bIsD3DMobilePreview = (Parameters.Platform == EShaderPlatform::SP_PCD3D_ES3_1);
+	bool bDisableFp16 = (bIsOpenGL && bIsHlslcc) || bIsD3DFXC || bIsPreviewPlatform || bIsD3DMobilePreview;
 	OutEnvironment.SetDefine(TEXT("FFXM_HALF"), bDisableFp16 ? 0 : 1);
 
 	if (!bUsingDxc)

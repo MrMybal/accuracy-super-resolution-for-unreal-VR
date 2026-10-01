@@ -63,10 +63,11 @@ TAutoConsoleVariable<int32> CVarArmASRVelocitySource(
 	TEXT("r.ArmASR.VelocitySource"),
 	0,
 	TEXT("Motion vectors used by Arm ASR.\n")
-	TEXT(" 0: Auto (default). AppSpaceWarp motion vectors when SpaceWarp renders them this frame (mobile multiview), otherwise the scene velocity.\n")
-	TEXT("    If the project compiles the SpaceWarp velocity shaders (vr.SupportMobileSpaceWarp) but SpaceWarp is not running, the scene velocity\n")
-	TEXT("    holds unusable raw values, so camera motion is reconstructed from depth instead.\n")
-	TEXT(" 1: Scene velocity.\n")
+	TEXT(" 0: Auto (default), re-evaluated every frame so SpaceWarp can be toggled at runtime.\n")
+	TEXT("    SpaceWarp running this frame (mobile multiview): AppSpaceWarp motion vectors.\n")
+	TEXT("    Otherwise the scene velocity. With vr.SupportMobileSpaceWarp the velocity shaders write raw signed values: they are read as is\n")
+	TEXT("    when the engine patch made the scene velocity a float target, otherwise camera motion is reconstructed from depth.\n")
+	TEXT(" 1: Scene velocity (raw when the SpaceWarp shaders are compiled and the target is float, depth only if it is not).\n")
 	TEXT(" 2: AppSpaceWarp motion vectors when available, otherwise Auto.\n")
 	TEXT(" 3: Depth only (camera motion, moving objects will ghost). For debugging."),
 	ECVF_RenderThreadSafe);
@@ -925,23 +926,33 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FArmASRTemporalUpscaler::AddP
 			&& SceneTextures.MotionVector->Desc.Dimension == ETextureDimension::Texture2DArray
 			&& SceneTextures.MotionVector->Desc.ArraySize >= NumEyes;
 
+		// The engine patch stores the scene velocity in a float target when the SpaceWarp shaders are compiled,
+		// which keeps their raw signed output readable.
+		const EPixelFormat VelocityFormat = VelocityTexture->Desc.Format;
+		const bool bFloatSceneVelocity = (VelocityFormat == PF_G16R16F || VelocityFormat == PF_FloatRGBA || VelocityFormat == PF_G32R32F || VelocityFormat == PF_A32B32G32R32F);
+
+		// Re-evaluated every frame: SpaceWarp can be switched on and off at runtime.
 		const int32 RequestedSource = CVarArmASRVelocitySource.GetValueOnRenderThread();
-		if (RequestedSource == 1)
-		{
-			Frame.VelocitySource = EArmASRVelocitySource::SceneVelocity;
-		}
-		else if (RequestedSource == 3)
+
+		// Scene velocity when the SpaceWarp shaders are compiled. While SpaceWarp runs, the patched engine skips the
+		// scene velocity pass (unless r.ArmASR.VelocitySource is 1), so it is not valid on those frames.
+		const bool bSceneVelocitySkipped = View.Family->bRenderStereoVelocity && RequestedSource != 1;
+		const EArmASRVelocitySource SpaceWarpShadersSceneSource = (bFloatSceneVelocity && !bSceneVelocitySkipped)
+			? EArmASRVelocitySource::SceneVelocityRaw
+			: EArmASRVelocitySource::DepthOnly;
+
+		if (RequestedSource == 3)
 		{
 			Frame.VelocitySource = EArmASRVelocitySource::DepthOnly;
 		}
-		else if (bSpaceWarpRendered)
+		else if (RequestedSource != 1 && bSpaceWarpRendered)
 		{
 			Frame.VelocitySource = EArmASRVelocitySource::SpaceWarp;
 			SpaceWarpMotionVector = SceneTextures.MotionVector;
 		}
 		else
 		{
-			Frame.VelocitySource = bSpaceWarpShaders ? EArmASRVelocitySource::DepthOnly : EArmASRVelocitySource::SceneVelocity;
+			Frame.VelocitySource = bSpaceWarpShaders ? SpaceWarpShadersSceneSource : EArmASRVelocitySource::SceneVelocity;
 		}
 	}
 

@@ -27,7 +27,7 @@ import stat
 import sys
 
 PATCH_ID = "ARMASR_VR_PATCH"
-PATCH_VERSION = 2
+PATCH_VERSION = 3
 DEFAULT_ENGINE = r"J:\_AtlasXRInc\Unreality"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -128,14 +128,17 @@ PATCHES = [
              helper("MobileShadingRenderer")
              + "// BEGIN ARMASR_VR_PATCH - with the SpaceWarp velocity shaders, the scene velocity holds raw signed values in a UNORM\n"
                "// target that Arm ASR cannot use: it reads the AppSpaceWarp motion vectors (or depth) instead, so the pass is wasted.\n"
-               "static bool ArmASRVR_SkipSceneVelocity(const FSceneViewFamily& ViewFamily, EShaderPlatform ShaderPlatform)\n"
+               "// Evaluated every frame, so SpaceWarp can be toggled at runtime: the scene velocity is rendered again as soon as\n"
+               "// SpaceWarp stops producing motion vectors.\n"
+               "static bool ArmASRVR_SkipSceneVelocity(const FSceneViewFamily& ViewFamily, EShaderPlatform ShaderPlatform, bool bSpaceWarpMotionVectorsRendered)\n"
                "{\n"
                "\tstatic const TConsoleVariableData<int32>* CVarVelocitySource = nullptr;\n"
                "\tif (!CVarVelocitySource)\n"
                "\t{\n"
                "\t\tCVarVelocitySource = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT(\"r.ArmASR.VelocitySource\"));\n"
                "\t}\n"
-               "\treturn ArmASRVR_IsMobileUpscaleEnabled_MobileShadingRenderer()\n"
+               "\treturn bSpaceWarpMotionVectorsRendered\n"
+               "\t\t&& ArmASRVR_IsMobileUpscaleEnabled_MobileShadingRenderer()\n"
                "\t\t&& ViewFamily.GetTemporalUpscalerInterface() != nullptr\n"
                "\t\t&& SupportsSpaceWarp(ShaderPlatform)\n"
                "\t\t&& CVarVelocitySource && CVarVelocitySource->GetValueOnAnyThread() != 1;\n"
@@ -148,7 +151,31 @@ PATCHES = [
              "\t\t\t\t\t\t|| (ViewFamily.GetTemporalUpscalerInterface() != nullptr && ArmASRVR_IsMobileUpscaleEnabled_MobileShadingRenderer()) /* ARMASR_VR_PATCH */"),
             ("replace",
              "\t\tif (bShouldRenderVelocities)\n\t\t{\n\t\t\t// Render the velocities of movable objects\n",
-             "\t\tif (bShouldRenderVelocities && !ArmASRVR_SkipSceneVelocity(ViewFamily, ShaderPlatform) /* ARMASR_VR_PATCH */)\n\t\t{\n\t\t\t// Render the velocities of movable objects\n"),
+             "\t\tif (bShouldRenderVelocities\n"
+             "\t\t\t// BEGIN ARMASR_VR_PATCH\n"
+             "\t\t\t&& !ArmASRVR_SkipSceneVelocity(ViewFamily, ShaderPlatform,\n"
+             "\t\t\t\tViewFamily.bRenderStereoVelocity && Views[0].bIsMobileMultiViewEnabled && HasMotionVectorRenderTargets(SceneTextures))\n"
+             "\t\t\t// END ARMASR_VR_PATCH\n"
+             "\t\t\t)\n"
+             "\t\t{\n\t\t\t// Render the velocities of movable objects\n"),
+        ],
+    },
+    {
+        "file": "Engine/Source/Runtime/Renderer/Private/VelocityRendering.cpp",
+        "why": "Store the scene velocity in a float target when the SpaceWarp velocity shaders are compiled, so their raw signed "
+               "output stays readable by Arm ASR on frames where SpaceWarp is off.",
+        "edits": [
+            ("before",
+             "EPixelFormat FVelocityRendering::GetFormat(EShaderPlatform ShaderPlatform)\n",
+             helper("VelocityRendering")),
+            ("after",
+             "EPixelFormat FVelocityRendering::GetFormat(EShaderPlatform ShaderPlatform)\n{\n",
+             "\t// BEGIN ARMASR_VR_PATCH - SUPPORT_VR_FRAME_EXTRAPOLATION velocity shaders write raw signed NDC motion, which a UNORM target clamps.\n"
+             "\tif (SupportsSpaceWarp(ShaderPlatform) && ArmASRVR_IsMobileUpscaleEnabled_VelocityRendering())\n"
+             "\t{\n"
+             "\t\treturn PF_G16R16F;\n"
+             "\t}\n"
+             "\t// END ARMASR_VR_PATCH\n"),
         ],
     },
     {

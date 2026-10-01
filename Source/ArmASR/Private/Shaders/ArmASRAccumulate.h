@@ -67,6 +67,10 @@ public:
 		{
 			return false;
 		}
+		if (!IsArmASRQualityPermutationUsed(PermutationVector))
+		{
+			return false;
+		}
 		return FArmASRGlobalShader::ShouldCompilePermutation(Parameters);
 	}
 
